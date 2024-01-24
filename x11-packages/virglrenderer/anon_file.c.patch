@@ -1,0 +1,22 @@
+diff --git a/src/mesa/util/anon_file.c b/src/mesa/util/anon_file.c
+index d4faa2fe..20c69fdd 100644
+--- a/src/mesa/util/anon_file.c
++++ b/src/mesa/util/anon_file.c
+@@ -36,7 +36,7 @@
+ 
+ #if defined(HAVE_MEMFD_CREATE) || defined(__FreeBSD__) || defined(__OpenBSD__)
+ #include <sys/mman.h>
+-#elif defined(ANDROID)
++#elif defined(__ANDROID__)
+ #include <sys/syscall.h>
+ #include <linux/memfd.h>
+ #else
+@@ -118,7 +118,7 @@ os_create_anonymous_file(off_t size, const char *debug_name)
+    if (!debug_name)
+       debug_name = "mesa-shared";
+    fd = memfd_create(debug_name, MFD_CLOEXEC | MFD_ALLOW_SEALING);
+-#elif defined(ANDROID)
++#elif defined(__ANDROID__)
+    if (!debug_name)
+       debug_name = "mesa-shared";
+    fd = syscall(SYS_memfd_create, debug_name, MFD_CLOEXEC | MFD_ALLOW_SEALING);
