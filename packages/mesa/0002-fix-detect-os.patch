@@ -1,0 +1,74 @@
+diff --git a/include/vulkan/vk_android_native_buffer.h b/include/vulkan/vk_android_native_buffer.h
+index d8fe747e498..d45b1a646cc 100644
+--- a/include/vulkan/vk_android_native_buffer.h
++++ b/include/vulkan/vk_android_native_buffer.h
+@@ -18,7 +18,7 @@
+ #define __VK_ANDROID_NATIVE_BUFFER_H__
+ 
+ /* MESA: A hack to avoid #ifdefs in driver code. */
+-#ifdef __ANDROID__
++#if defined (__ANDROID__) && !defined (__TERMUX__)
+ #include <cutils/native_handle.h>
+ #include <vulkan/vulkan.h>
+ 
+diff --git a/src/util/detect_os.h b/src/util/detect_os.h
+index 19f8e3372df..5e942c1a69e 100644
+--- a/src/util/detect_os.h
++++ b/src/util/detect_os.h
+@@ -24,7 +24,7 @@
+  * Android defines __linux__, so DETECT_OS_LINUX and DETECT_OS_UNIX will
+  * also be defined.
+  */
+-#if defined(__ANDROID__)
++#if defined(__ANDROID__) && !defined (__TERMUX__)
+ #define DETECT_OS_ANDROID 1
+ #endif
+ 
+diff --git a/src/util/reallocarray.h b/src/util/reallocarray.h
+index 602013919bc..441dfb33aeb 100644
+--- a/src/util/reallocarray.h
++++ b/src/util/reallocarray.h
+@@ -40,8 +40,15 @@ extern "C" {
+  */
+ #define MUL_NO_OVERFLOW ((size_t)1 << (sizeof(size_t) * 4))
+ 
++#if defined (__ANDROID__)
++#define reallocarray _reallocarray
++
++static inline void *
++_reallocarray(void *optr, size_t nmemb, size_t size)
++#else
+ static inline void *
+ reallocarray(void *optr, size_t nmemb, size_t size)
++#endif
+ {
+         if ((nmemb >= MUL_NO_OVERFLOW || size >= MUL_NO_OVERFLOW) &&
+             nmemb > 0 && SIZE_MAX / nmemb < size) {
+diff --git a/src/util/strtod.c b/src/util/strtod.c
+index 4b92ff1f39d..80b73e86363 100644
+--- a/src/util/strtod.c
++++ b/src/util/strtod.c
+@@ -63,6 +63,10 @@ _mesa_get_locale(void)
+ 
+ #endif
+ 
++#if defined (__ANDROID__)
++#undef HAVE_STRTOD_L
++#endif
++
+ /**
+  * Wrapper around strtod which uses the "C" locale so the decimal
+  * point is always '.'
+diff --git a/src/gallium/targets/dri/target.c b/src/gallium/targets/dri/target.c
+index 0915a84480d..d1281c7f8c1 100644
+--- a/src/gallium/targets/dri/target.c
++++ b/src/gallium/targets/dri/target.c
+@@ -142,7 +142,7 @@ DEFINE_LOADER_DRM_ENTRYPOINT(lima)
+ #endif
+ 
+ #if defined(GALLIUM_ZINK)
+-#if DETECT_OS_ANDROID
++#if DETECT_OS_ANDROID && !defined (__TERMUX__)
+ DEFINE_LOADER_DRM_ENTRYPOINT(zink);
+ #else
+ const __DRIextension **__driDriverGetExtensions_zink(void);
