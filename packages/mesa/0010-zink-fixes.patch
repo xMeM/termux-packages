@@ -1,0 +1,74 @@
+diff --git a/src/egl/drivers/dri2/egl_dri2.c b/src/egl/drivers/dri2/egl_dri2.c
+index 5857acbcdf3..7e3ff08caad 100644
+--- a/src/egl/drivers/dri2/egl_dri2.c
++++ b/src/egl/drivers/dri2/egl_dri2.c
+@@ -962,7 +962,7 @@ dri2_setup_extensions(_EGLDisplay *disp)
+ #ifdef HAVE_DRI3_MODIFIERS
+ #ifdef HAVE_X11_PLATFORM
+    if (dri2_dpy->conn) {
+-      bool err;
++      bool err = false;
+       dri2_dpy->multibuffers_available = loader_dri3_check_multibuffer(dri2_dpy->conn, &err) &&
+                                          !err &&
+                                          (dri2_dpy->image && dri2_dpy->image->base.version >= 15);
+diff --git a/src/egl/drivers/dri2/platform_wayland.c b/src/egl/drivers/dri2/platform_wayland.c
+index 18817ad73d1..1c55f185ef6 100644
+--- a/src/egl/drivers/dri2/platform_wayland.c
++++ b/src/egl/drivers/dri2/platform_wayland.c
+@@ -2977,8 +2977,7 @@ dri2_initialize_wayland_swrast(_EGLDisplay *disp)
+       goto cleanup;
+ 
+    if (disp->Options.Zink) {
+-      if (!dri2_initialize_wayland_drm_extensions(dri2_dpy) && !disp->Options.ForceSoftware)
+-         goto cleanup;
++      dri2_initialize_wayland_drm_extensions(dri2_dpy);
+    }
+ 
+    dri2_dpy->driver_name = strdup(disp->Options.Zink ? "zink" : "swrast");
+diff --git a/src/gallium/drivers/zink/zink_screen.c b/src/gallium/drivers/zink/zink_screen.c
+index 75e4997d4be..5fcc75bccd1 100644
+--- a/src/gallium/drivers/zink/zink_screen.c
++++ b/src/gallium/drivers/zink/zink_screen.c
+@@ -1673,6 +1673,11 @@ zink_get_display_device(const struct zink_screen *screen, uint32_t pdev_count,
+       if (drm_props.renderMajor == dev_major &&
+           drm_props.renderMinor == dev_minor)
+          return i;
++
++#if defined (__ANDROID__) && defined (__TERMUX__)
++      if (props.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU)
++         return i;
++#endif
+    }
+ 
+    return -1;
+@@ -2392,7 +2397,7 @@ VkSemaphore
+ zink_screen_export_dmabuf_semaphore(struct zink_screen *screen, struct zink_resource *res)
+ {
+    VkSemaphore sem = VK_NULL_HANDLE;
+-#if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD)
++#if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD) && !defined (__TERMUX__)
+    struct dma_buf_export_sync_file export = {
+       .flags = DMA_BUF_SYNC_RW,
+       .fd = -1,
+@@ -2447,7 +2452,7 @@ zink_screen_export_dmabuf_semaphore(struct zink_screen *screen, struct zink_reso
+ bool
+ zink_screen_import_dmabuf_semaphore(struct zink_screen *screen, struct zink_resource *res, VkSemaphore sem)
+ {
+-#if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD)
++#if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD) && !defined (__TERMUX__)
+    const VkSemaphoreGetFdInfoKHR get_fd_info = {
+       .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+       .semaphore = sem,
+diff --git a/src/gallium/targets/dri/dri_target.c b/src/gallium/targets/dri/dri_target.c
+index 6604afe99f5..ad0fbf2bc03 100644
+--- a/src/gallium/targets/dri/dri_target.c
++++ b/src/gallium/targets/dri/dri_target.c
+@@ -143,7 +143,7 @@ DEFINE_LOADER_DRM_ENTRYPOINT(lima)
+ #endif
+ 
+ #if defined(GALLIUM_ZINK)
+-#if DETECT_OS_ANDROID
++#if DETECT_OS_ANDROID && !defined (__TERMUX__)
+ DEFINE_LOADER_DRM_ENTRYPOINT(zink);
+ #else
+ const __DRIextension **__driDriverGetExtensions_zink(void);

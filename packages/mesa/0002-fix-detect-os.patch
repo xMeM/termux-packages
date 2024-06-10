@@ -1,0 +1,59 @@
+diff --git a/src/util/detect_os.h b/src/util/detect_os.h
+index 19f8e3372df..5e942c1a69e 100644
+--- a/src/util/detect_os.h
++++ b/src/util/detect_os.h
+@@ -24,7 +24,7 @@
+  * Android defines __linux__, so DETECT_OS_LINUX and DETECT_OS_UNIX will
+  * also be defined.
+  */
+-#if defined(__ANDROID__)
++#if defined(__ANDROID__) && !defined (__TERMUX__)
+ #define DETECT_OS_ANDROID 1
+ #endif
+ 
+diff --git a/include/vulkan/vk_android_native_buffer.h b/include/vulkan/vk_android_native_buffer.h
+index 80e5d26c8ee..7aa9a1754dd 100644
+--- a/include/vulkan/vk_android_native_buffer.h
++++ b/include/vulkan/vk_android_native_buffer.h
+@@ -1,5 +1,5 @@
+ /* MESA: A hack to avoid #ifdefs in driver code. */
+-#ifdef __ANDROID__
++#if defined (__ANDROID__) && !defined (__TERMUX__)
+ 
+ #include <cutils/native_handle.h>
+ #if ANDROID_API_LEVEL < 28
+diff --git a/src/util/reallocarray.h b/src/util/reallocarray.h
+index 602013919bc..441dfb33aeb 100644
+--- a/src/util/reallocarray.h
++++ b/src/util/reallocarray.h
+@@ -40,8 +40,15 @@ extern "C" {
+  */
+ #define MUL_NO_OVERFLOW ((size_t)1 << (sizeof(size_t) * 4))
+ 
++#if defined (__ANDROID__)
++#define reallocarray _reallocarray
++
++static inline void *
++_reallocarray(void *optr, size_t nmemb, size_t size)
++#else
+ static inline void *
+ reallocarray(void *optr, size_t nmemb, size_t size)
++#endif
+ {
+         if ((nmemb >= MUL_NO_OVERFLOW || size >= MUL_NO_OVERFLOW) &&
+             nmemb > 0 && SIZE_MAX / nmemb < size) {
+diff --git a/src/util/strtod.c b/src/util/strtod.c
+index 4b92ff1f39d..80b73e86363 100644
+--- a/src/util/strtod.c
++++ b/src/util/strtod.c
+@@ -63,6 +63,10 @@ _mesa_get_locale(void)
+ 
+ #endif
+ 
++#if defined (__ANDROID__)
++#undef HAVE_STRTOD_L
++#endif
++
+ /**
+  * Wrapper around strtod which uses the "C" locale so the decimal
+  * point is always '.'

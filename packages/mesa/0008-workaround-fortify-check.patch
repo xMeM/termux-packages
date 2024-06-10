@@ -128,3 +128,24 @@ https://github.com/termux/termux-packages/issues/18823
  }
  
  
+diff --git a/src/util/cnd_monotonic.c b/src/util/cnd_monotonic.c
+index 71d9ac0d247..e9dc84b8dc1 100644
+--- a/src/util/cnd_monotonic.c
++++ b/src/util/cnd_monotonic.c
+@@ -132,7 +132,7 @@ u_cnd_monotonic_timedwait(struct u_cnd_monotonic *cond, mtx_t *mtx,
+    timespec_sub_saturate(&rel_time, abs_time, &now_time);
+    int rt = pthread_cond_timedwait_relative_np(&cond->cond, mtx, &rel_time);
+ #else
+-   int rt = pthread_cond_timedwait(&cond->cond, mtx, abs_time);
++   int rt = pthread_cond_timedwait(&cond->cond, &mtx->mutex, abs_time);
+ #endif
+    if (rt == ETIMEDOUT)
+       return thrd_timedout;
+@@ -151,6 +151,6 @@ u_cnd_monotonic_wait(struct u_cnd_monotonic *cond, mtx_t *mtx)
+                             (PCRITICAL_SECTION)mtx, INFINITE);
+    return thrd_success;
+ #else
+-   return (pthread_cond_wait(&cond->cond, mtx) == 0) ? thrd_success : thrd_error;
++   return (pthread_cond_wait(&cond->cond, &mtx->mutex) == 0) ? thrd_success : thrd_error;
+ #endif
+ }
