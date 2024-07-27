@@ -1,0 +1,88 @@
+diff --git a/src/egl/drivers/dri2/egl_dri2.c b/src/egl/drivers/dri2/egl_dri2.c
+index e813aa61f52..93535d79a62 100644
+--- a/src/egl/drivers/dri2/egl_dri2.c
++++ b/src/egl/drivers/dri2/egl_dri2.c
+@@ -841,6 +841,9 @@ dri2_setup_device(_EGLDisplay *disp, EGLBoolean software)
+    _EGLDevice *dev;
+    int render_fd;
+ 
++   if (disp->Options.Zink && dri2_dpy->fd_render_gpu < 0)
++      software = true;
++
+    /* If we're not software, we need a DRM node FD */
+    assert(software || dri2_dpy->fd_render_gpu >= 0);
+ 
+diff --git a/src/egl/drivers/dri2/platform_wayland.c b/src/egl/drivers/dri2/platform_wayland.c
+index 513d2d0709b..979f40f00ee 100644
+--- a/src/egl/drivers/dri2/platform_wayland.c
++++ b/src/egl/drivers/dri2/platform_wayland.c
+@@ -2184,6 +2184,9 @@ dri2_initialize_wayland_drm_extensions(struct dri2_egl_display *dri2_dpy)
+       dmabuf_feedback_format_table_fini(&dri2_dpy->format_table);
+    }
+ 
++   if (dri2_dpy->kopper)
++      return true;
++
+    /* We couldn't retrieve a render node from the dma-buf feedback (or the
+     * feedback was not advertised at all), so we must fallback to wl_drm. */
+    if (dri2_dpy->fd_render_gpu == -1) {
+diff --git a/src/gallium/drivers/zink/zink_screen.c b/src/gallium/drivers/zink/zink_screen.c
+index e4e63f7a35c..13d1d304f96 100644
+--- a/src/gallium/drivers/zink/zink_screen.c
++++ b/src/gallium/drivers/zink/zink_screen.c
+@@ -2351,6 +2351,10 @@ zink_screen_export_dmabuf_semaphore(struct zink_screen *screen, struct zink_reso
+ {
+    VkSemaphore sem = VK_NULL_HANDLE;
+ #if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD)
++   static bool no_dma_buf_sync_file = false;
++   if (no_dma_buf_sync_file)
++      return sem;
++
+    struct dma_buf_export_sync_file export = {
+       .flags = DMA_BUF_SYNC_RW,
+       .fd = -1,
+@@ -2375,7 +2379,7 @@ zink_screen_export_dmabuf_semaphore(struct zink_screen *screen, struct zink_reso
+    int ret = drmIoctl(fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &export);
+    if (ret) {
+       if (errno == ENOTTY || errno == EBADF || errno == ENOSYS) {
+-         assert(!"how did this fail?");
++         no_dma_buf_sync_file = true;
+          return VK_NULL_HANDLE;
+       } else {
+          mesa_loge("MESA: failed to import sync file '%s'", strerror(errno));
+@@ -2406,6 +2410,10 @@ bool
+ zink_screen_import_dmabuf_semaphore(struct zink_screen *screen, struct zink_resource *res, VkSemaphore sem)
+ {
+ #if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD)
++   static bool no_dma_buf_sync_file = false;
++   if (no_dma_buf_sync_file)
++      return sem;
++
+    const VkSemaphoreGetFdInfoKHR get_fd_info = {
+       .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+       .semaphore = sem,
+@@ -2437,7 +2445,8 @@ zink_screen_import_dmabuf_semaphore(struct zink_screen *screen, struct zink_reso
+       int ioctl_ret = drmIoctl(fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &import);
+       if (ioctl_ret) {
+          if (errno == ENOTTY || errno == EBADF || errno == ENOSYS) {
+-            assert(!"how did this fail?");
++            no_dma_buf_sync_file = true;
++            ret = true;
+          } else {
+             ret = true;
+          }
+diff --git a/src/gallium/drivers/zink/zink_compiler.c b/src/gallium/drivers/zink/zink_compiler.c
+index fea48d90fe0..d5942501165 100644
+--- a/src/gallium/drivers/zink/zink_compiler.c
++++ b/src/gallium/drivers/zink/zink_compiler.c
+@@ -4086,6 +4086,10 @@ zink_shader_compile(struct zink_screen *screen, bool can_shobj, struct zink_shad
+             NIR_PASS_V(nir, nir_remove_dead_variables, nir_var_shader_temp, NULL);
+             need_optimize = true;
+          }
++         if (zink_driverid(screen) == VK_DRIVER_ID_QUALCOMM_PROPRIETARY) {
++            NIR_PASS_V(nir, nir_lower_io_to_vector, nir_var_shader_in);
++            need_optimize = true;
++         }
+          break;
+       case MESA_SHADER_COMPUTE:
+          if (zink_cs_key(key)->robust_access)
