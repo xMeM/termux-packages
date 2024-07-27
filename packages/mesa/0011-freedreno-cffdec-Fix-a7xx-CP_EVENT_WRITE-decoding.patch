@@ -1,0 +1,34 @@
+From 26be3a32eb493594764f53096645c0156f2f0056 Mon Sep 17 00:00:00 2001
+From: Rob Clark <robdclark@chromium.org>
+Date: Sat, 20 Jul 2024 08:47:04 -0700
+Subject: [PATCH 11/17] freedreno/cffdec: Fix a7xx CP_EVENT_WRITE decoding
+
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+---
+ src/freedreno/decode/cffdec.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/freedreno/decode/cffdec.c b/src/freedreno/decode/cffdec.c
+index c2c743eb275..d8147ac1094 100644
+--- a/src/freedreno/decode/cffdec.c
++++ b/src/freedreno/decode/cffdec.c
+@@ -1900,7 +1900,7 @@ static void dump_register_summary(int level);
+ static void
+ cp_event_write(uint32_t *dwords, uint32_t sizedwords, int level)
+ {
+-   const char *name = rnn_enumname(rnn, "vgt_event_type", dwords[0]);
++   const char *name = rnn_enumname(rnn, "vgt_event_type", dwords[0] & 0xff);
+    printl(2, "%sevent %s\n", levels[level], name);
+ 
+    if (name && (options->info->chip > 5)) {
+@@ -2955,6 +2955,7 @@ static const struct type3_op {
+    /* for a7xx */
+    CP(THREAD_CONTROL, cp_set_thread_control),
+    CP(CONTEXT_REG_BUNCH2, cp_context_reg_bunch2),
++   CP(EVENT_WRITE7, cp_event_write),
+ };
+ 
+ static void
+-- 
+2.45.2
+

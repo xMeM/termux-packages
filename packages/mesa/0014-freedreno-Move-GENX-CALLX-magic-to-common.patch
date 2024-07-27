@@ -1,0 +1,297 @@
+From a1668fceb83ad9f5c70afb79026782567c950176 Mon Sep 17 00:00:00 2001
+From: Rob Clark <robdclark@chromium.org>
+Date: Thu, 18 Jul 2024 14:41:45 -0700
+Subject: [PATCH 14/17] freedreno: Move GENX/CALLX magic to common
+
+And re-use them in the gallium driver
+
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+---
+ src/freedreno/common/freedreno_common.h       | 29 +++++++++++++++++++
+ src/freedreno/vulkan/tu_common.h              | 27 ++---------------
+ .../drivers/freedreno/a6xx/fd6_blitter.cc     | 23 +++------------
+ .../drivers/freedreno/a6xx/fd6_compute.cc     |  5 +---
+ .../drivers/freedreno/a6xx/fd6_context.cc     |  5 +---
+ .../drivers/freedreno/a6xx/fd6_draw.cc        |  5 +---
+ .../drivers/freedreno/a6xx/fd6_emit.cc        |  8 ++---
+ .../drivers/freedreno/a6xx/fd6_gmem.cc        |  5 +---
+ .../drivers/freedreno/a6xx/fd6_image.cc       |  4 +--
+ .../drivers/freedreno/a6xx/fd6_program.cc     |  5 +---
+ .../drivers/freedreno/a6xx/fd6_rasterizer.cc  |  4 +--
+ .../drivers/freedreno/a6xx/fd6_screen.cc      |  6 +---
+ 12 files changed, 46 insertions(+), 80 deletions(-)
+
+diff --git a/src/freedreno/common/freedreno_common.h b/src/freedreno/common/freedreno_common.h
+index d895f0711db..51d3bb5af2b 100644
+--- a/src/freedreno/common/freedreno_common.h
++++ b/src/freedreno/common/freedreno_common.h
+@@ -27,6 +27,35 @@
+ #include "util/u_atomic.h"
+ 
+ #ifdef __cplusplus
++
++#include <tuple>
++
++#define __FD_GPU_GENS A6XX, A7XX
++#define FD_GENX(FUNC_NAME)                                                   \
++   template <chip... CHIPs> constexpr auto FUNC_NAME##instantiate()          \
++   {                                                                         \
++      return std::tuple_cat(std::make_tuple(FUNC_NAME<CHIPs>)...);           \
++   }                                                                         \
++   static constexpr auto FUNC_NAME##tmpl __attribute__((used)) =             \
++      FUNC_NAME##instantiate<__FD_GPU_GENS>();
++
++#define FD_CALLX(info, thing)                                                \
++   ({                                                                        \
++      decltype(&thing<A6XX>) genX_thing;                                     \
++      switch (info->chip) {                                                  \
++      case 6:                                                                \
++         genX_thing = &thing<A6XX>;                                          \
++         break;                                                              \
++      case 7:                                                                \
++         genX_thing = &thing<A7XX>;                                          \
++         break;                                                              \
++      default:                                                               \
++         unreachable("Unknown hardware generation");                         \
++      }                                                                      \
++      genX_thing;                                                            \
++   })
++
++
+ template<typename E>
+ struct BitmaskEnum {
+    E value;
+diff --git a/src/freedreno/vulkan/tu_common.h b/src/freedreno/vulkan/tu_common.h
+index b605cea6c2d..aa0a8252ca5 100644
+--- a/src/freedreno/vulkan/tu_common.h
++++ b/src/freedreno/vulkan/tu_common.h
+@@ -131,30 +131,9 @@
+ #define MAX_FDM_TEXEL_SIZE_LOG2 10
+ #define MAX_FDM_TEXEL_SIZE (1u << MAX_FDM_TEXEL_SIZE_LOG2)
+ 
+-#define TU_GPU_GENS A6XX, A7XX
+-#define TU_GENX(FUNC_NAME)                                                   \
+-   template <chip... CHIPs> constexpr auto FUNC_NAME##instantiate()          \
+-   {                                                                         \
+-      return std::tuple_cat(std::make_tuple(FUNC_NAME<CHIPs>)...);           \
+-   }                                                                         \
+-   static constexpr auto FUNC_NAME##tmpl __attribute__((used)) =             \
+-      FUNC_NAME##instantiate<TU_GPU_GENS>();
+-
+-#define TU_CALLX(device, thing)                                              \
+-   ({                                                                        \
+-      decltype(&thing<A6XX>) genX_thing;                                     \
+-      switch ((device)->physical_device->info->chip) {                       \
+-      case 6:                                                                \
+-         genX_thing = &thing<A6XX>;                                          \
+-         break;                                                              \
+-      case 7:                                                                \
+-         genX_thing = &thing<A7XX>;                                          \
+-         break;                                                              \
+-      default:                                                               \
+-         unreachable("Unknown hardware generation");                         \
+-      }                                                                      \
+-      genX_thing;                                                            \
+-   })
++#define TU_GENX(FUNC_NAME) FD_GENX(FUNC_NAME)
++
++#define TU_CALLX(device, thing) FD_CALLX((device)->physical_device->info, thing)
+ 
+ /* vk object types */
+ struct tu_buffer;
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_blitter.cc b/src/gallium/drivers/freedreno/a6xx/fd6_blitter.cc
+index 65264cbdda1..ff8918f3d89 100644
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_blitter.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_blitter.cc
+@@ -844,9 +844,7 @@ fd6_clear_lrz(struct fd_batch *batch, struct fd_resource *zsbuf,
+    OUT_PKT7(ring, CP_BLIT, 1);
+    OUT_RING(ring, CP_BLIT_0_OP(BLIT_OP_SCALE));
+ }
+-
+-template void fd6_clear_lrz<A6XX>(struct fd_batch *batch, struct fd_resource *zsbuf, struct fd_bo *lrz, double depth);
+-template void fd6_clear_lrz<A7XX>(struct fd_batch *batch, struct fd_resource *zsbuf, struct fd_bo *lrz, double depth);
++FD_GENX(fd6_clear_lrz);
+ 
+ /**
+  * Handle conversion of clear color
+@@ -921,13 +919,7 @@ fd6_clear_surface(struct fd_context *ctx, struct fd_ringbuffer *ring,
+       OUT_RING(ring, 0); /* RB_DBG_ECO_CNTL */
+    }
+ }
+-
+-template void fd6_clear_surface<A6XX>(struct fd_context *ctx, struct fd_ringbuffer *ring,
+-                                      struct pipe_surface *psurf, const struct pipe_box *box2d,
+-                                      union pipe_color_union *color, uint32_t unknown_8c01);
+-template void fd6_clear_surface<A7XX>(struct fd_context *ctx, struct fd_ringbuffer *ring,
+-                                      struct pipe_surface *psurf, const struct pipe_box *box2d,
+-                                      union pipe_color_union *color, uint32_t unknown_8c01);
++FD_GENX(fd6_clear_surface);
+ 
+ template <chip CHIP>
+ static void
+@@ -1100,11 +1092,7 @@ fd6_resolve_tile(struct fd_batch *batch, struct fd_ringbuffer *ring,
+    fd6_emit_flushes(batch->ctx, ring,
+                     FD6_FLUSH_CCU_COLOR | FD6_WAIT_FOR_IDLE);
+ }
+-
+-template void fd6_resolve_tile<A6XX>(struct fd_batch *batch, struct fd_ringbuffer *ring,
+-                                     uint32_t base, struct pipe_surface *psurf, uint32_t unknown_8c01);
+-template void fd6_resolve_tile<A7XX>(struct fd_batch *batch, struct fd_ringbuffer *ring,
+-                                     uint32_t base, struct pipe_surface *psurf, uint32_t unknown_8c01);
++FD_GENX(fd6_resolve_tile);
+ 
+ template <chip CHIP>
+ static bool
+@@ -1406,10 +1394,7 @@ fd6_blitter_init(struct pipe_context *pctx)
+    pctx->clear_texture = fd6_clear_texture<CHIP>;
+    ctx->blit = fd6_blit<CHIP>;
+ }
+-
+-/* Teach the compiler about needed variants: */
+-template void fd6_blitter_init<A6XX>(struct pipe_context *pctx);
+-template void fd6_blitter_init<A7XX>(struct pipe_context *pctx);
++FD_GENX(fd6_blitter_init);
+ 
+ unsigned
+ fd6_tile_mode_for_format(enum pipe_format pfmt)
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_compute.cc b/src/gallium/drivers/freedreno/a6xx/fd6_compute.cc
+index 5b94f4567ae..2d0ec85e16c 100644
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_compute.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_compute.cc
+@@ -270,7 +270,4 @@ fd6_compute_init(struct pipe_context *pctx)
+    pctx->create_compute_state = fd6_compute_state_create;
+    pctx->delete_compute_state = fd6_compute_state_delete;
+ }
+-
+-/* Teach the compiler about needed variants: */
+-template void fd6_compute_init<A6XX>(struct pipe_context *pctx);
+-template void fd6_compute_init<A7XX>(struct pipe_context *pctx);
++FD_GENX(fd6_compute_init);
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_context.cc b/src/gallium/drivers/freedreno/a6xx/fd6_context.cc
+index 54a6445dfa9..45c84b2be5e 100644
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_context.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_context.cc
+@@ -331,7 +331,4 @@ fd6_context_create(struct pipe_screen *pscreen, void *priv,
+ 
+    return fd_context_init_tc(pctx, flags);
+ }
+-
+-/* Teach the compiler about needed variants: */
+-template struct pipe_context *fd6_context_create<A6XX>(struct pipe_screen *pscreen, void *priv, unsigned flags);
+-template struct pipe_context *fd6_context_create<A7XX>(struct pipe_screen *pscreen, void *priv, unsigned flags);
++FD_GENX(fd6_context_create);
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc b/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
+index 53e9aed4fe0..e5b772965b2 100644
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
+@@ -687,7 +687,4 @@ fd6_draw_init(struct pipe_context *pctx)
+    ctx->update_draw = fd6_update_draw<CHIP>;
+    fd6_update_draw<CHIP>(ctx);
+ }
+-
+-/* Teach the compiler about needed variants: */
+-template void fd6_draw_init<A6XX>(struct pipe_context *pctx);
+-template void fd6_draw_init<A7XX>(struct pipe_context *pctx);
++FD_GENX(fd6_draw_init);
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_emit.cc b/src/gallium/drivers/freedreno/a6xx/fd6_emit.cc
+index 5e2d436ad32..c1a35a4d2f2 100644
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_emit.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_emit.cc
+@@ -799,9 +799,7 @@ fd6_emit_ccu_cntl(struct fd_ringbuffer *ring, struct fd_screen *screen, bool gme
+                             .color_offset = offset,
+                             ));
+ }
+-
+-template void fd6_emit_cs_state<A6XX>(struct fd_context *ctx, struct fd_ringbuffer *ring, struct fd6_compute_state *cs);
+-template void fd6_emit_cs_state<A7XX>(struct fd_context *ctx, struct fd_ringbuffer *ring, struct fd6_compute_state *cs);
++FD_GENX(fd6_emit_cs_state);
+ 
+ template <chip CHIP>
+ static void
+@@ -980,9 +978,7 @@ fd6_emit_restore(struct fd_batch *batch, struct fd_ringbuffer *ring)
+       trace_end_state_restore(&batch->trace, ring);
+    }
+ }
+-
+-template void fd6_emit_restore<A6XX>(struct fd_batch *batch, struct fd_ringbuffer *ring);
+-template void fd6_emit_restore<A7XX>(struct fd_batch *batch, struct fd_ringbuffer *ring);
++FD_GENX(fd6_emit_restore);
+ 
+ static void
+ fd6_mem_to_mem(struct fd_ringbuffer *ring, struct pipe_resource *dst,
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_gmem.cc b/src/gallium/drivers/freedreno/a6xx/fd6_gmem.cc
+index 12ae7714d61..0e47359a2ed 100644
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_gmem.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_gmem.cc
+@@ -1932,7 +1932,4 @@ fd6_gmem_init(struct pipe_context *pctx)
+    ctx->emit_sysmem = fd6_emit_sysmem<CHIP>;
+    ctx->emit_sysmem_fini = fd6_emit_sysmem_fini;
+ }
+-
+-/* Teach the compiler about needed variants: */
+-template void fd6_gmem_init<A6XX>(struct pipe_context *pctx);
+-template void fd6_gmem_init<A7XX>(struct pipe_context *pctx);
++FD_GENX(fd6_gmem_init);
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_image.cc b/src/gallium/drivers/freedreno/a6xx/fd6_image.cc
+index 964211c1aa9..b42e40034e6 100644
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_image.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_image.cc
+@@ -346,9 +346,7 @@ fd6_build_bindless_state(struct fd_context *ctx, enum pipe_shader_type shader,
+ 
+    return ring;
+ }
+-
+-template struct fd_ringbuffer *fd6_build_bindless_state<A6XX>(struct fd_context *ctx, enum pipe_shader_type shader, bool append_fb_read);
+-template struct fd_ringbuffer *fd6_build_bindless_state<A7XX>(struct fd_context *ctx, enum pipe_shader_type shader, bool append_fb_read);
++FD_GENX(fd6_build_bindless_state);
+ 
+ static void
+ fd6_set_shader_buffers(struct pipe_context *pctx, enum pipe_shader_type shader,
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_program.cc b/src/gallium/drivers/freedreno/a6xx/fd6_program.cc
+index 3b5086577bc..8381eb591fc 100644
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_program.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_program.cc
+@@ -1473,7 +1473,4 @@ fd6_prog_init(struct pipe_context *pctx)
+ 
+    fd_prog_init(pctx);
+ }
+-
+-/* Teach the compiler about needed variants: */
+-template void fd6_prog_init<A6XX>(struct pipe_context *pctx);
+-template void fd6_prog_init<A7XX>(struct pipe_context *pctx);
++FD_GENX(fd6_prog_init);
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_rasterizer.cc b/src/gallium/drivers/freedreno/a6xx/fd6_rasterizer.cc
+index d636a9e8643..6e7d45938ba 100644
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_rasterizer.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_rasterizer.cc
+@@ -114,9 +114,7 @@ __fd6_setup_rasterizer_stateobj(struct fd_context *ctx,
+ 
+    return ring;
+ }
+-
+-template struct fd_ringbuffer *__fd6_setup_rasterizer_stateobj<A6XX>(struct fd_context *ctx, const struct pipe_rasterizer_state *cso, bool primitive_restart);
+-template struct fd_ringbuffer *__fd6_setup_rasterizer_stateobj<A7XX>(struct fd_context *ctx, const struct pipe_rasterizer_state *cso, bool primitive_restart);
++FD_GENX(__fd6_setup_rasterizer_stateobj);
+ 
+ void *
+ fd6_rasterizer_state_create(struct pipe_context *pctx,
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_screen.cc b/src/gallium/drivers/freedreno/a6xx/fd6_screen.cc
+index aa712abca04..7ae0ca8d92f 100644
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_screen.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_screen.cc
+@@ -179,11 +179,7 @@ fd6_screen_init(struct pipe_screen *pscreen)
+          FD_GMEM_DEPTH_ENABLED | FD_GMEM_STENCIL_ENABLED |
+          FD_GMEM_BLEND_ENABLED | FD_GMEM_LOGICOP_ENABLED);
+ 
+-   if (screen->gen == 7) {
+-      pscreen->context_create = fd6_context_create<A7XX>;
+-   } else {
+-      pscreen->context_create = fd6_context_create<A6XX>;
+-   }
++   pscreen->context_create = FD_CALLX(screen->info, fd6_context_create);
+    pscreen->is_format_supported = fd6_screen_is_format_supported;
+ 
+    screen->tile_mode = fd6_tile_mode;
+-- 
+2.45.2
+

@@ -1,0 +1,117 @@
+From ec0a483fb178985895fb7e75ef154024e42bae9d Mon Sep 17 00:00:00 2001
+From: Mark Collins <mark@igalia.com>
+Date: Thu, 30 May 2024 05:26:02 +0000
+Subject: [PATCH 06/17] tu: Emit GRAS_LRZ_DEPTH_BUFFER_INFO correctly
+
+This register stores the depth format of the underlying depth
+buffer, it seemingly doesn't change anything about the LRZ buffer
+itself and has no behavioral changes over setting it to 0.
+
+However, it's possible that there's some case where it does matter
+so matching the proprietary driver's behavior is safer.
+
+Signed-off-by: Mark Collins <mark@igalia.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/29453>
+---
+ src/freedreno/registers/adreno/a6xx.xml |  5 ++++-
+ src/freedreno/vulkan/tu_clear_blit.cc   | 11 +++++------
+ src/freedreno/vulkan/tu_lrz.cc          | 10 ++++++----
+ 3 files changed, 15 insertions(+), 11 deletions(-)
+
+diff --git a/src/freedreno/registers/adreno/a6xx.xml b/src/freedreno/registers/adreno/a6xx.xml
+index fb7bb279ecf..293f2235379 100644
+--- a/src/freedreno/registers/adreno/a6xx.xml
++++ b/src/freedreno/registers/adreno/a6xx.xml
+@@ -2347,7 +2347,10 @@ to upconvert to 32b float internally?
+ 	<!-- A bit tentative but it's a color and it is followed by LRZ_CLEAR -->
+ 	<reg32 offset="0x8111" name="GRAS_LRZ_CLEAR_DEPTH_F32" type="float" variants="A7XX-"/>
+ 
+-	<reg32 offset="0x8113" name="GRAS_LRZ_DEPTH_BUFFER_INFO" variants="A7XX-" usage="rp_blit"/>
++	<reg32 offset="0x8113" name="GRAS_LRZ_DEPTH_BUFFER_INFO" variants="A7XX-" usage="rp_blit">
++		<bitfield name="DEPTH_FORMAT" low="0" high="2" type="a6xx_depth_format"/>
++		<bitfield name="UNK3" pos="3"/>
++	</reg32>
+ 
+ 	<!-- Always written together and always equal 09510840 00000a62 -->
+ 	<reg32 offset="0x8120" name="GRAS_UNKNOWN_8120" variants="A7XX-" usage="cmd"/>
+diff --git a/src/freedreno/vulkan/tu_clear_blit.cc b/src/freedreno/vulkan/tu_clear_blit.cc
+index b4422bb8644..7966985b098 100644
+--- a/src/freedreno/vulkan/tu_clear_blit.cc
++++ b/src/freedreno/vulkan/tu_clear_blit.cc
+@@ -1317,7 +1317,6 @@ r3d_src_gmem(struct tu_cmd_buffer *cmd,
+    r3d_src_common(cmd, cs, desc, 0, 0, VK_FILTER_NEAREST);
+ }
+ 
+-template <chip CHIP>
+ static void
+ r3d_dst(struct tu_cs *cs, const struct fdl6_view *iview, uint32_t layer,
+         enum pipe_format src_format)
+@@ -1339,9 +1338,6 @@ r3d_dst(struct tu_cs *cs, const struct fdl6_view *iview, uint32_t layer,
+    tu_cs_emit_pkt4(cs, REG_A6XX_RB_MRT_FLAG_BUFFER(0), 3);
+    tu_cs_image_flag_ref(cs, iview, layer);
+ 
+-   if (CHIP >= A7XX)
+-      tu_cs_emit_regs(cs, A7XX_GRAS_LRZ_DEPTH_BUFFER_INFO(0));
+-
+    /* Use color format from RB_MRT_BUF_INFO. This register is relevant for
+     * FMT6_NV12_Y.
+     */
+@@ -1541,6 +1537,9 @@ r3d_setup(struct tu_cmd_buffer *cmd,
+    tu_cs_emit_regs(cs, A6XX_GRAS_LRZ_CNTL(0));
+    tu_cs_emit_regs(cs, A6XX_RB_LRZ_CNTL(0));
+ 
++   if (CHIP >= A7XX)
++      tu_cs_emit_regs(cs, A7XX_GRAS_LRZ_DEPTH_BUFFER_INFO());
++
+    tu_cs_emit_write_reg(cs, REG_A6XX_GRAS_SC_CNTL,
+                         A6XX_GRAS_SC_CNTL_CCUSINGLECACHELINESIZE(2));
+ 
+@@ -1661,7 +1660,7 @@ static const struct blit_ops r3d_ops = {
+    .clear_value = r3d_clear_value,
+    .src = r3d_src,
+    .src_buffer = r3d_src_buffer<CHIP>,
+-   .dst = r3d_dst<CHIP>,
++   .dst = r3d_dst,
+    .dst_depth = r3d_dst_depth,
+    .dst_stencil = r3d_dst_stencil,
+    .dst_buffer = r3d_dst_buffer,
+@@ -3812,7 +3811,7 @@ store_3d_blit(struct tu_cmd_buffer *cmd,
+          r3d_dst_stencil(cs, iview, layer);
+       }
+    } else {
+-      r3d_dst<CHIP>(cs, &iview->view, layer, src_format);
++      r3d_dst(cs, &iview->view, layer, src_format);
+    }
+ 
+    r3d_src_gmem<CHIP>(cmd, cs, iview, src_format, dst_format, gmem_offset, cpp);
+diff --git a/src/freedreno/vulkan/tu_lrz.cc b/src/freedreno/vulkan/tu_lrz.cc
+index 3c175133335..f694f7a88c8 100644
+--- a/src/freedreno/vulkan/tu_lrz.cc
++++ b/src/freedreno/vulkan/tu_lrz.cc
+@@ -62,7 +62,7 @@ tu6_emit_lrz_buffer(struct tu_cs *cs, struct tu_image *depth_image)
+                       A6XX_GRAS_LRZ_FAST_CLEAR_BUFFER_BASE(0));
+ 
+       if (CHIP >= A7XX)
+-         tu_cs_emit_regs(cs, A7XX_GRAS_LRZ_DEPTH_BUFFER_INFO(0));
++         tu_cs_emit_regs(cs, A7XX_GRAS_LRZ_DEPTH_BUFFER_INFO());
+ 
+       return;
+    }
+@@ -77,9 +77,11 @@ tu6_emit_lrz_buffer(struct tu_cs *cs, struct tu_image *depth_image)
+                    A6XX_GRAS_LRZ_BUFFER_PITCH(.pitch = depth_image->lrz_pitch),
+                    A6XX_GRAS_LRZ_FAST_CLEAR_BUFFER_BASE(.qword = lrz_fc_iova));
+ 
+-   if (CHIP >= A7XX)
+-      // TODO: Figure out the correct value to set here.
+-      tu_cs_emit_regs(cs, A7XX_GRAS_LRZ_DEPTH_BUFFER_INFO(0));
++   if (CHIP >= A7XX) {
++      tu_cs_emit_regs(cs, A7XX_GRAS_LRZ_DEPTH_BUFFER_INFO(
++         .depth_format = tu6_pipe2depth(depth_image->vk.format)
++      ));
++   }
+ }
+ 
+ static void
+-- 
+2.45.2
+

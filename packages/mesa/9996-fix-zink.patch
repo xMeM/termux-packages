@@ -1,0 +1,34 @@
+diff --git a/src/gallium/drivers/zink/zink_screen.c b/src/gallium/drivers/zink/zink_screen.c
+index 34bfe1fc04e..d3ae9cf84a0 100644
+--- a/src/gallium/drivers/zink/zink_screen.c
++++ b/src/gallium/drivers/zink/zink_screen.c
+@@ -1665,6 +1665,11 @@ zink_get_display_device(const struct zink_screen *screen, uint32_t pdev_count,
+       if (drm_props.renderMajor == dev_major &&
+           drm_props.renderMinor == dev_minor)
+          return i;
++
++#if defined (__ANDROID__) && defined (__TERMUX__)
++      if (props.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU)
++         return i;
++#endif
+    }
+ 
+    return -1;
+@@ -2381,7 +2386,7 @@ VkSemaphore
+ zink_screen_export_dmabuf_semaphore(struct zink_screen *screen, struct zink_resource *res)
+ {
+    VkSemaphore sem = VK_NULL_HANDLE;
+-#if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD)
++#if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD) && !defined (__TERMUX__)
+    struct dma_buf_export_sync_file export = {
+       .flags = DMA_BUF_SYNC_RW,
+       .fd = -1,
+@@ -2436,7 +2441,7 @@ zink_screen_export_dmabuf_semaphore(struct zink_screen *screen, struct zink_reso
+ bool
+ zink_screen_import_dmabuf_semaphore(struct zink_screen *screen, struct zink_resource *res, VkSemaphore sem)
+ {
+-#if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD)
++#if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD) && !defined (__TERMUX__)
+    const VkSemaphoreGetFdInfoKHR get_fd_info = {
+       .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+       .semaphore = sem,

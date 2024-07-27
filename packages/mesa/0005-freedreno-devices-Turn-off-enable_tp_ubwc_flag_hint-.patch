@@ -1,0 +1,31 @@
+From d778330f996e8a062dfc1a137b2bed6613fe189b Mon Sep 17 00:00:00 2001
+From: Danylo Piliaiev <dpiliaiev@igalia.com>
+Date: Mon, 17 Jun 2024 19:45:42 +0200
+Subject: [PATCH 05/17] freedreno/devices: Turn off enable_tp_ubwc_flag_hint
+ for a740 by default
+
+Most devices with a740 have blob v6xx which doesn't have TP_UBWC_FLAG_HINT
+set. Match them for better compatibility by default.
+
+Signed-off-by: Danylo Piliaiev <dpiliaiev@igalia.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/29754>
+---
+ src/freedreno/common/freedreno_devices.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/freedreno/common/freedreno_devices.py b/src/freedreno/common/freedreno_devices.py
+index e60d4a6a71b..ca045919aa5 100644
+--- a/src/freedreno/common/freedreno_devices.py
++++ b/src/freedreno/common/freedreno_devices.py
+@@ -808,7 +808,7 @@ a7xx_740 = A7XXProps(
+         has_event_write_sample_count = True,
+         ubwc_unorm_snorm_int_compatible = True,
+         supports_ibo_ubwc = True,
+-        enable_tp_ubwc_flag_hint = True,
++        enable_tp_ubwc_flag_hint = False,
+     )
+ 
+ a7xx_750 = A7XXProps(
+-- 
+2.45.2
+

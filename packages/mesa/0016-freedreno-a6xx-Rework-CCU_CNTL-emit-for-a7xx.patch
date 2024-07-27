@@ -1,0 +1,241 @@
+From 852c9604d6c083d6bb0e0b406d4bd442278397c0 Mon Sep 17 00:00:00 2001
+From: Rob Clark <robdclark@chromium.org>
+Date: Fri, 19 Jul 2024 11:55:20 -0700
+Subject: [PATCH 16/17] freedreno/a6xx: Rework CCU_CNTL emit for a7xx
+
+Regs are different, and a750+ gets new configuration for VPC cache in
+GMEM.
+
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+---
+ .../drivers/freedreno/a6xx/fd6_blitter.cc     |  2 +-
+ .../drivers/freedreno/a6xx/fd6_emit.cc        | 67 ++++++++++++++-----
+ src/gallium/drivers/freedreno/a6xx/fd6_emit.h |  1 +
+ .../drivers/freedreno/a6xx/fd6_gmem.cc        |  8 +--
+ .../drivers/freedreno/a6xx/fd6_screen.cc      | 25 ++++++-
+ .../drivers/freedreno/freedreno_screen.h      | 17 ++++-
+ 6 files changed, 93 insertions(+), 27 deletions(-)
+
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_blitter.cc b/src/gallium/drivers/freedreno/a6xx/fd6_blitter.cc
+index 1e2ee9de6c0..a49276957b2 100644
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_blitter.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_blitter.cc
+@@ -262,7 +262,7 @@ emit_setup(struct fd_batch *batch)
+ 
+    /* normal BLIT_OP_SCALE operation needs bypass RB_CCU_CNTL */
+    OUT_WFI5(ring);
+-   fd6_emit_ccu_cntl(ring, screen, false);
++   fd6_emit_ccu_cntl<CHIP>(ring, screen, false);
+ }
+ 
+ template <chip CHIP>
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_emit.cc b/src/gallium/drivers/freedreno/a6xx/fd6_emit.cc
+index de44a9b9398..be31132253a 100644
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_emit.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_emit.cc
+@@ -777,29 +777,60 @@ fd6_emit_cs_state(struct fd_context *ctx, struct fd_ringbuffer *ring,
+ 
+    fd6_state_emit(&state, ring);
+ }
++FD_GENX(fd6_emit_cs_state);
+ 
++template <chip CHIP>
+ void
+ fd6_emit_ccu_cntl(struct fd_ringbuffer *ring, struct fd_screen *screen, bool gmem)
+ {
+-   enum a6xx_ccu_cache_size cache_size = (enum a6xx_ccu_cache_size)(screen->info->a6xx.gmem_ccu_color_cache_fraction);
+-   uint32_t offset = gmem ? screen->ccu_offset_gmem : screen->ccu_offset_bypass;
+-   uint32_t offset_hi = offset >> 21;
+-   offset &= 0x1fffff;
+-
+-   OUT_REG(ring,
+-           A6XX_RB_CCU_CNTL(.gmem_fast_clear_disable =
+-                               !screen->info->a6xx.has_gmem_fast_clear,
+-                            .concurrent_resolve =
+-                               screen->info->a6xx.concurrent_resolve,
+-                            .depth_offset_hi = 0,
+-                            .color_offset_hi = offset_hi,
+-                            .depth_cache_size = CCU_CACHE_SIZE_FULL,
+-                            .depth_offset = 0,
+-                            .color_cache_size = cache_size,
+-                            .color_offset = offset,
+-                            ));
++   const struct fd6_gmem_config *cfg = gmem ? &screen->config_gmem : &screen->config_sysmem;
++   enum a6xx_ccu_cache_size color_cache_size =
++      (enum a6xx_ccu_cache_size)(screen->info->a6xx.gmem_ccu_color_cache_fraction);
++   uint32_t color_offset = cfg->color_ccu_offset & 0x1fffff;
++   uint32_t color_offset_hi = cfg->color_ccu_offset >> 21;
++
++   uint32_t depth_offset = cfg->depth_ccu_offset & 0x1fffff;
++   uint32_t depth_offset_hi = cfg->depth_ccu_offset >> 21;
++
++   if (CHIP == A7XX) {
++      OUT_REG(ring,
++         A7XX_RB_CCU_CNTL2(
++            .depth_offset_hi = depth_offset_hi,
++            .color_offset_hi = color_offset_hi,
++            .depth_cache_size = CCU_CACHE_SIZE_FULL,
++            .depth_offset = depth_offset,
++            .color_cache_size = color_cache_size,
++            .color_offset = color_offset,
++         )
++      );
++
++      if (screen->info->a7xx.has_gmem_vpc_attr_buf) {
++         OUT_REG(ring,
++            A7XX_VPC_ATTR_BUF_SIZE_GMEM(.size_gmem = cfg->vpc_attr_buf_size),
++            A7XX_VPC_ATTR_BUF_BASE_GMEM(.base_gmem = cfg->vpc_attr_buf_offset)
++         );
++         OUT_REG(ring,
++            A7XX_PC_ATTR_BUF_SIZE_GMEM(.size_gmem = cfg->vpc_attr_buf_size)
++         );
++      }
++   } else {
++      OUT_REG(ring,
++         A6XX_RB_CCU_CNTL(
++            .gmem_fast_clear_disable =
++               !screen->info->a6xx.has_gmem_fast_clear,
++            .concurrent_resolve =
++               screen->info->a6xx.concurrent_resolve,
++            .depth_offset_hi = depth_offset_hi,
++            .color_offset_hi = color_offset_hi,
++            .depth_cache_size = CCU_CACHE_SIZE_FULL,
++            .depth_offset = depth_offset,
++            .color_cache_size = color_cache_size,
++            .color_offset = color_offset,
++         )
++      );
++   }
+ }
+-FD_GENX(fd6_emit_cs_state);
++FD_GENX(fd6_emit_ccu_cntl);
+ 
+ template <chip CHIP>
+ static void
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_emit.h b/src/gallium/drivers/freedreno/a6xx/fd6_emit.h
+index 4a456bdc144..0c5154bed85 100644
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_emit.h
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_emit.h
+@@ -398,6 +398,7 @@ template <chip CHIP>
+ void fd6_emit_cs_state(struct fd_context *ctx, struct fd_ringbuffer *ring,
+                        struct fd6_compute_state *cs) assert_dt;
+ 
++template <chip CHIP>
+ void fd6_emit_ccu_cntl(struct fd_ringbuffer *ring, struct fd_screen *screen, bool gmem);
+ 
+ template <chip CHIP>
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_gmem.cc b/src/gallium/drivers/freedreno/a6xx/fd6_gmem.cc
+index f23de8f4a92..0ad5bb4d1b6 100644
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_gmem.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_gmem.cc
+@@ -319,7 +319,7 @@ emit_lrz_clears(struct fd_batch *batch)
+       if (count == 0) {
+          struct fd_ringbuffer *ring = fd_batch_get_prologue(batch);
+ 
+-         fd6_emit_ccu_cntl(ring, ctx->screen, false);
++         fd6_emit_ccu_cntl<CHIP>(ring, ctx->screen, false);
+ 
+          OUT_PKT7(ring, CP_SET_MARKER, 1);
+          OUT_RING(ring, A6XX_CP_SET_MARKER_0_MODE(RM6_BLIT2DSCALE));
+@@ -954,7 +954,7 @@ emit_binning_pass(struct fd_batch *batch) assert_dt
+ 
+    OUT_WFI5(ring);
+ 
+-   fd6_emit_ccu_cntl(ring, screen, true);
++   fd6_emit_ccu_cntl<CHIP>(ring, screen, true);
+ }
+ 
+ static void
+@@ -1024,7 +1024,7 @@ fd6_emit_tile_init(struct fd_batch *batch) assert_dt
+    OUT_RING(ring, 0x1);
+ 
+    OUT_WFI5(ring);
+-   fd6_emit_ccu_cntl(ring, screen, true);
++   fd6_emit_ccu_cntl<CHIP>(ring, screen, true);
+ 
+    emit_zs<CHIP>(batch->ctx, ring, pfb->zsbuf, batch->gmem_state);
+    emit_mrt<CHIP>(ring, pfb, batch->gmem_state);
+@@ -1885,7 +1885,7 @@ fd6_emit_sysmem(struct fd_batch *batch)
+       }
+ 
+       OUT_WFI5(ring);
+-      fd6_emit_ccu_cntl(ring, screen, false);
++      fd6_emit_ccu_cntl<CHIP>(ring, screen, false);
+ 
+       struct pipe_framebuffer_state *pfb = &batch->framebuffer;
+       update_render_cntl<CHIP>(batch, pfb, false);
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_screen.cc b/src/gallium/drivers/freedreno/a6xx/fd6_screen.cc
+index 7ae0ca8d92f..415c05e9ba0 100644
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_screen.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_screen.cc
+@@ -167,9 +167,30 @@ fd6_screen_init(struct pipe_screen *pscreen)
+    uint32_t color_cache_size =
+       (screen->info->num_ccu * screen->info->a6xx.sysmem_per_ccu_color_cache_size) /
+       (1 << screen->info->a6xx.gmem_ccu_color_cache_fraction);
++   uint32_t color_cache_size_gmem =
++      color_cache_size /
++      (1 << screen->info->a6xx.gmem_ccu_color_cache_fraction);
++
++   struct fd6_gmem_config *gmem = &screen->config_gmem;
++   struct fd6_gmem_config *sysmem = &screen->config_sysmem;
++
++   sysmem->depth_ccu_offset = 0;
++   sysmem->color_ccu_offset = sysmem->depth_ccu_offset + depth_cache_size;
+ 
+-   screen->ccu_offset_bypass = depth_cache_size;
+-   screen->ccu_offset_gmem = screen->gmemsize_bytes - color_cache_size;
++   if (screen->info->a7xx.has_gmem_vpc_attr_buf) {
++      sysmem->vpc_attr_buf_size = screen->info->a7xx.sysmem_vpc_attr_buf_size;
++      sysmem->vpc_attr_buf_offset = sysmem->color_ccu_offset + color_cache_size;
++
++      gmem->vpc_attr_buf_size = screen->info->a7xx.gmem_vpc_attr_buf_size;
++      gmem->vpc_attr_buf_offset = screen->gmemsize_bytes -
++         (gmem->vpc_attr_buf_size * screen->info->num_ccu);
++
++      gmem->color_ccu_offset = gmem->vpc_attr_buf_offset - color_cache_size_gmem;
++      screen->gmemsize_bytes = gmem->vpc_attr_buf_offset;
++   } else {
++      gmem->depth_ccu_offset = 0;
++      gmem->color_ccu_offset = screen->gmemsize_bytes - color_cache_size_gmem;
++   }
+ 
+    /* Currently only FB_READ forces GMEM path, mostly because we'd have to
+     * deal with cmdstream patching otherwise..
+diff --git a/src/gallium/drivers/freedreno/freedreno_screen.h b/src/gallium/drivers/freedreno/freedreno_screen.h
+index 08341ee1c81..8a68ef0b40a 100644
+--- a/src/gallium/drivers/freedreno/freedreno_screen.h
++++ b/src/gallium/drivers/freedreno/freedreno_screen.h
+@@ -59,6 +59,20 @@ enum fd_gmem_reason {
+    FD_GMEM_FB_READ = BIT(5),
+ };
+ 
++/* Offset within GMEM of various "non-GMEM" things that GMEM is used to
++ * cache.  These offsets differ for gmem vs sysmem rendering (in sysmem
++ * mode, the entire GMEM can be used)
++ */
++struct fd6_gmem_config {
++   /* Color/depth CCU cache: */
++   uint32_t color_ccu_offset;
++   uint32_t depth_ccu_offset;
++
++   /* Vertex attrib cache (a750+): */
++   uint32_t vpc_attr_buf_size;
++   uint32_t vpc_attr_buf_offset;
++};
++
+ struct fd_screen {
+    struct pipe_screen base;
+ 
+@@ -104,8 +118,7 @@ struct fd_screen {
+ 
+    struct fd_dev_info dev_info;
+    const struct fd_dev_info *info;
+-   uint32_t ccu_offset_gmem;
+-   uint32_t ccu_offset_bypass;
++   struct fd6_gmem_config config_gmem, config_sysmem;
+ 
+    /* Bitmask of gmem_reasons that do not force GMEM path over bypass
+     * for current generation.
+-- 
+2.45.2
+

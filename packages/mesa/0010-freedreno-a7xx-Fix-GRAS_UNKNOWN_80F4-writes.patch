@@ -1,0 +1,35 @@
+From fd2f34211bc02b83492faa41639a9b0781bea7ec Mon Sep 17 00:00:00 2001
+From: Rob Clark <robdclark@chromium.org>
+Date: Mon, 22 Jul 2024 10:18:45 -0700
+Subject: [PATCH 10/17] freedreno/a7xx: Fix GRAS_UNKNOWN_80F4 writes
+
+If this is a 64b reg, we should write both halves.
+
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+---
+ src/freedreno/common/freedreno_devices.py | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/freedreno/common/freedreno_devices.py b/src/freedreno/common/freedreno_devices.py
+index ca045919aa5..45a525f615d 100644
+--- a/src/freedreno/common/freedreno_devices.py
++++ b/src/freedreno/common/freedreno_devices.py
+@@ -1007,6 +1007,7 @@ add_gpus([
+             [A6XXRegs.REG_A6XX_RB_UNKNOWN_88F4,   0x00000000],
+             [A6XXRegs.REG_A7XX_HLSQ_UNKNOWN_A9AD, 0x00000000],
+             [A6XXRegs.REG_A7XX_GRAS_UNKNOWN_80F4, 0x00000000],
++            [A6XXRegs.REG_A7XX_GRAS_UNKNOWN_80F5, 0x00000000],
+         ],
+     ))
+ 
+@@ -1081,6 +1082,7 @@ add_gpus([
+             [A6XXRegs.REG_A6XX_RB_UNKNOWN_88F4,   0x00000000],
+             [A6XXRegs.REG_A7XX_HLSQ_UNKNOWN_A9AD, 0x00000000],
+             [A6XXRegs.REG_A7XX_GRAS_UNKNOWN_80F4, 0x00000000],
++            [A6XXRegs.REG_A7XX_GRAS_UNKNOWN_80F5, 0x00000000],
+ 
+             [0x930a, 0],
+             [0x960a, 1],
+-- 
+2.45.2
+

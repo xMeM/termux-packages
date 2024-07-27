@@ -1,0 +1,83 @@
+From 729479cc9060354a2be82f6193fc6a58422503d8 Mon Sep 17 00:00:00 2001
+From: Rob Clark <robdclark@chromium.org>
+Date: Mon, 22 Jul 2024 07:22:18 -0700
+Subject: [PATCH 09/17] freedreno/a6xx: Implement reg stomper support
+
+Useful to track down issues related to uninitialized regs.
+
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+---
+ src/gallium/drivers/freedreno/a6xx/fd6_emit.cc  | 17 +++++++++++++++++
+ .../drivers/freedreno/freedreno_screen.c        |  1 +
+ src/gallium/drivers/freedreno/freedreno_util.h  |  1 +
+ 3 files changed, 19 insertions(+)
+
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_emit.cc b/src/gallium/drivers/freedreno/a6xx/fd6_emit.cc
+index 478a5ceaa4c..5e2d436ad32 100644
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_emit.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_emit.cc
+@@ -37,6 +37,7 @@
+ #include "freedreno_query_hw.h"
+ #include "freedreno_resource.h"
+ #include "freedreno_state.h"
++#include "freedreno_stompable_regs.h"
+ #include "freedreno_tracepoints.h"
+ 
+ #include "fd6_blend.h"
+@@ -802,6 +803,17 @@ fd6_emit_ccu_cntl(struct fd_ringbuffer *ring, struct fd_screen *screen, bool gme
+ template void fd6_emit_cs_state<A6XX>(struct fd_context *ctx, struct fd_ringbuffer *ring, struct fd6_compute_state *cs);
+ template void fd6_emit_cs_state<A7XX>(struct fd_context *ctx, struct fd_ringbuffer *ring, struct fd6_compute_state *cs);
+ 
++template <chip CHIP>
++static void
++fd6_emit_stomp(struct fd_ringbuffer *ring, const uint16_t *regs, size_t count)
++{
++   for (size_t i = 0; i < count; i++) {
++      if (fd_reg_stomp_allowed(CHIP, regs[i])) {
++         WRITE(regs[i], 0xffffffff);
++      }
++   }
++}
++
+ /* emit setup at begin of new cmdstream buffer (don't rely on previous
+  * state, there could have been a context switch between ioctls):
+  */
+@@ -815,6 +827,11 @@ fd6_emit_restore(struct fd_batch *batch, struct fd_ringbuffer *ring)
+       trace_start_state_restore(&batch->trace, ring);
+    }
+ 
++   if (FD_DBG(STOMP)) {
++      fd6_emit_stomp<CHIP>(ring, &RP_BLIT_REGS<CHIP>[0], ARRAY_SIZE(RP_BLIT_REGS<CHIP>));
++      fd6_emit_stomp<CHIP>(ring, &CMD_REGS<CHIP>[0], ARRAY_SIZE(CMD_REGS<CHIP>));
++   }
++
+    OUT_PKT7(ring, CP_SET_MODE, 1);
+    OUT_RING(ring, 0);
+ 
+diff --git a/src/gallium/drivers/freedreno/freedreno_screen.c b/src/gallium/drivers/freedreno/freedreno_screen.c
+index 0eed065a21d..416d40f0d1a 100644
+--- a/src/gallium/drivers/freedreno/freedreno_screen.c
++++ b/src/gallium/drivers/freedreno/freedreno_screen.c
+@@ -98,6 +98,7 @@ static const struct debug_named_value fd_debug_options[] = {
+    {"nofp16",    FD_DBG_NOFP16,   "Disable mediump precision lowering"},
+    {"nohw",      FD_DBG_NOHW,     "Disable submitting commands to the HW"},
+    {"nosbin",    FD_DBG_NOSBIN,   "Execute GMEM bins in raster order instead of 'S' pattern"},
++   {"stomp",     FD_DBG_STOMP,    "Enable register stomper"},
+    DEBUG_NAMED_VALUE_END
+ };
+ /* clang-format on */
+diff --git a/src/gallium/drivers/freedreno/freedreno_util.h b/src/gallium/drivers/freedreno/freedreno_util.h
+index 0088694ec90..d5ffcf4e7ef 100644
+--- a/src/gallium/drivers/freedreno/freedreno_util.h
++++ b/src/gallium/drivers/freedreno/freedreno_util.h
+@@ -102,6 +102,7 @@ enum fd_debug_flag {
+    FD_DBG_NOFP16       = BITFIELD_BIT(27),
+    FD_DBG_NOHW         = BITFIELD_BIT(28),
+    FD_DBG_NOSBIN       = BITFIELD_BIT(29),
++   FD_DBG_STOMP        = BITFIELD_BIT(30),
+ };
+ /* clang-format on */
+ 
+-- 
+2.45.2
+

@@ -1,0 +1,90 @@
+From 1c5edc74c75cf6b1238b94c1d61c7f8a7bf6a9e0 Mon Sep 17 00:00:00 2001
+From: Danylo Piliaiev <dpiliaiev@igalia.com>
+Date: Mon, 17 Jun 2024 18:35:52 +0200
+Subject: [PATCH 04/17] tu: Add enable_tp_ubwc_flag_hint feature to a7xx
+
+On a740 TPL1_DBG_ECO_CNTL1.TP_UBWC_FLAG_HINT must be the same between
+all drivers in the system, somehow having different values affects
+BLIT_OP_SCALE. We cannot automatically match blob's value, so the
+best thing we could do is a toggle.
+
+Example:
+ FD_DEV_FEATURES=enable_tp_ubwc_flag_hint=0
+
+Signed-off-by: Danylo Piliaiev <dpiliaiev@igalia.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/29754>
+---
+ src/freedreno/common/freedreno_dev_info.h |  7 +++++++
+ src/freedreno/common/freedreno_devices.py |  3 +++
+ src/freedreno/vulkan/tu_cmd_buffer.cc     | 12 +++++++++++-
+ 3 files changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/src/freedreno/common/freedreno_dev_info.h b/src/freedreno/common/freedreno_dev_info.h
+index e27bc1ddee2..b1aaf55269e 100644
+--- a/src/freedreno/common/freedreno_dev_info.h
++++ b/src/freedreno/common/freedreno_dev_info.h
+@@ -236,6 +236,13 @@ struct fd_dev_info {
+        * fully compatible.
+        */
+       bool ubwc_unorm_snorm_int_compatible;
++
++      /* On a740 TPL1_DBG_ECO_CNTL1.TP_UBWC_FLAG_HINT must be the same between
++       * all drivers in the system, somehow having different values affects
++       * BLIT_OP_SCALE. We cannot automatically match blob's value, so the
++       * best thing we could do is a toggle.
++       */
++      bool enable_tp_ubwc_flag_hint;
+    } a7xx;
+ };
+ 
+diff --git a/src/freedreno/common/freedreno_devices.py b/src/freedreno/common/freedreno_devices.py
+index 03505788024..e60d4a6a71b 100644
+--- a/src/freedreno/common/freedreno_devices.py
++++ b/src/freedreno/common/freedreno_devices.py
+@@ -795,10 +795,12 @@ a7xx_base = A6XXProps(
+ a7xx_725 = A7XXProps(
+         cmdbuf_start_a725_quirk = True,
+         supports_ibo_ubwc = True,
++        enable_tp_ubwc_flag_hint = True,
+     )
+ 
+ a7xx_730 = A7XXProps(
+         supports_ibo_ubwc = True,
++        enable_tp_ubwc_flag_hint = True,
+     )
+ 
+ a7xx_740 = A7XXProps(
+@@ -806,6 +808,7 @@ a7xx_740 = A7XXProps(
+         has_event_write_sample_count = True,
+         ubwc_unorm_snorm_int_compatible = True,
+         supports_ibo_ubwc = True,
++        enable_tp_ubwc_flag_hint = True,
+     )
+ 
+ a7xx_750 = A7XXProps(
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index da6edad6546..99a818c50ce 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -1260,7 +1260,17 @@ tu6_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+       if (!magic_reg.reg)
+          break;
+ 
+-      tu_cs_emit_write_reg(cs, magic_reg.reg, magic_reg.value);
++      uint32_t value = magic_reg.value;
++      switch(magic_reg.reg) {
++         case REG_A6XX_TPL1_DBG_ECO_CNTL1:
++            value = (value & ~A6XX_TPL1_DBG_ECO_CNTL1_TP_UBWC_FLAG_HINT) |
++                    (phys_dev->info->a7xx.enable_tp_ubwc_flag_hint
++                        ? A6XX_TPL1_DBG_ECO_CNTL1_TP_UBWC_FLAG_HINT
++                        : 0);
++            break;
++      }
++
++      tu_cs_emit_write_reg(cs, magic_reg.reg, value);
+    }
+ 
+    tu_cs_emit_write_reg(cs, REG_A6XX_RB_DBG_ECO_CNTL,
+-- 
+2.45.2
+

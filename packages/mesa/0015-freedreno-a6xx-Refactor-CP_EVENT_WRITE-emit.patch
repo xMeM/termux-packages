@@ -1,0 +1,1386 @@
+From b55517a7a15c68b9e95fbd8cdd7eb2b344f91271 Mon Sep 17 00:00:00 2001
+From: Rob Clark <robdclark@chromium.org>
+Date: Fri, 19 Jul 2024 08:53:57 -0700
+Subject: [PATCH 15/17] freedreno/a6xx: Refactor CP_EVENT_WRITE emit
+
+Consolidate the various uses of CP_EVENT_WRITE into helpers, and use use
+fd_gpu_event to manage the differences between a6xx and a7xx.  This is a
+bit churny as it spreading a fair bit of the CHIP template param around.
+
+Signed-off-by: Rob Clark <robdclark@chromium.org>
+---
+ .../drivers/freedreno/a6xx/fd6_barrier.cc     |  56 ++------
+ .../drivers/freedreno/a6xx/fd6_barrier.h      |   2 +
+ .../drivers/freedreno/a6xx/fd6_blitter.cc     |  63 ++++-----
+ .../drivers/freedreno/a6xx/fd6_compute.cc     |   4 +-
+ .../drivers/freedreno/a6xx/fd6_context.cc     |   2 +-
+ .../drivers/freedreno/a6xx/fd6_draw.cc        |  11 +-
+ .../drivers/freedreno/a6xx/fd6_emit.cc        |   2 +-
+ src/gallium/drivers/freedreno/a6xx/fd6_emit.h |  95 +++++++++----
+ .../drivers/freedreno/a6xx/fd6_gmem.cc        | 130 +++++++++---------
+ .../drivers/freedreno/a6xx/fd6_query.cc       | 122 ++++++++--------
+ .../drivers/freedreno/a6xx/fd6_query.h        |   2 +-
+ .../drivers/freedreno/freedreno_batch.h       |   3 +
+ 12 files changed, 261 insertions(+), 231 deletions(-)
+
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_barrier.cc b/src/gallium/drivers/freedreno/a6xx/fd6_barrier.cc
+index ca2513d8fd4..ad4ca07c538 100644
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_barrier.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_barrier.cc
+@@ -26,44 +26,9 @@
+ #include "freedreno_batch.h"
+ 
+ #include "fd6_barrier.h"
+-#include "fd6_context.h"
+-
+-/* TODO probably more of the various fd6_event_write() should be
+- * consolidated here.
+- */
+-
+-static uint32_t
+-event_write(struct fd_context *ctx, struct fd_ringbuffer *ring,
+-            enum vgt_event_type evt)
+-{
+-   bool timestamp = false;
+-   switch (evt) {
+-   case CACHE_FLUSH_TS:
+-   case WT_DONE_TS:
+-   case RB_DONE_TS:
+-   case PC_CCU_FLUSH_DEPTH_TS:
+-   case PC_CCU_FLUSH_COLOR_TS:
+-   case PC_CCU_RESOLVE_TS:
+-      timestamp = true;
+-      break;
+-   default:
+-      break;
+-   }
+-
+-   OUT_PKT7(ring, CP_EVENT_WRITE, timestamp ? 4 : 1);
+-   OUT_RING(ring, CP_EVENT_WRITE_0_EVENT(evt));
+-   if (timestamp) {
+-      struct fd6_context *fd6_ctx = fd6_context(ctx);
+-      uint32_t seqno = ++fd6_ctx->seqno;
+-      OUT_RELOC(ring, control_ptr(fd6_ctx, seqno)); /* ADDR_LO/HI */
+-      OUT_RING(ring, seqno);
+-
+-      return seqno;
+-   }
+-
+-   return 0;
+-}
++#include "fd6_emit.h"
+ 
++template <chip CHIP>
+ void
+ fd6_emit_flushes(struct fd_context *ctx, struct fd_ringbuffer *ring,
+                  unsigned flushes)
+@@ -74,22 +39,22 @@ fd6_emit_flushes(struct fd_context *ctx, struct fd_ringbuffer *ring,
+     * However it does seem to work for UCHE.
+     */
+    if (flushes & (FD6_FLUSH_CCU_COLOR | FD6_INVALIDATE_CCU_COLOR))
+-      event_write(ctx, ring, PC_CCU_FLUSH_COLOR_TS);
++      fd6_event_write<CHIP>(ctx, ring, FD_CCU_CLEAN_COLOR);
+ 
+    if (flushes & (FD6_FLUSH_CCU_DEPTH | FD6_INVALIDATE_CCU_DEPTH))
+-      event_write(ctx, ring, PC_CCU_FLUSH_DEPTH_TS);
++      fd6_event_write<CHIP>(ctx, ring, FD_CCU_CLEAN_DEPTH);
+ 
+    if (flushes & FD6_INVALIDATE_CCU_COLOR)
+-      event_write(ctx, ring, PC_CCU_INVALIDATE_COLOR);
++      fd6_event_write<CHIP>(ctx, ring, FD_CCU_INVALIDATE_COLOR);
+ 
+    if (flushes & FD6_INVALIDATE_CCU_DEPTH)
+-      event_write(ctx, ring, PC_CCU_INVALIDATE_DEPTH);
++      fd6_event_write<CHIP>(ctx, ring, FD_CCU_INVALIDATE_DEPTH);
+ 
+    if (flushes & FD6_FLUSH_CACHE)
+-      event_write(ctx, ring, CACHE_FLUSH_TS);
++      fd6_event_write<CHIP>(ctx, ring, FD_CACHE_CLEAN);
+ 
+    if (flushes & FD6_INVALIDATE_CACHE)
+-      event_write(ctx, ring, CACHE_INVALIDATE);
++      fd6_event_write<CHIP>(ctx, ring, FD_CACHE_INVALIDATE);
+ 
+    if (flushes & FD6_WAIT_MEM_WRITES)
+       OUT_PKT7(ring, CP_WAIT_MEM_WRITES, 0);
+@@ -100,13 +65,16 @@ fd6_emit_flushes(struct fd_context *ctx, struct fd_ringbuffer *ring,
+    if (flushes & FD6_WAIT_FOR_ME)
+       OUT_PKT7(ring, CP_WAIT_FOR_ME, 0);
+ }
++FD_GENX(fd6_emit_flushes);
+ 
++template <chip CHIP>
+ void
+ fd6_barrier_flush(struct fd_batch *batch)
+ {
+-   fd6_emit_flushes(batch->ctx, batch->draw, batch->barrier);
++   fd6_emit_flushes<CHIP>(batch->ctx, batch->draw, batch->barrier);
+    batch->barrier = 0;
+ }
++FD_GENX(fd6_barrier_flush);
+ 
+ static void
+ add_flushes(struct pipe_context *pctx, unsigned flushes)
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_barrier.h b/src/gallium/drivers/freedreno/a6xx/fd6_barrier.h
+index 7cdd17d835d..325c8967631 100644
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_barrier.h
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_barrier.h
+@@ -41,9 +41,11 @@ enum fd6_flush {
+    FD6_WAIT_FOR_ME          = BIT(8),
+ };
+ 
++template <chip CHIP>
+ void fd6_emit_flushes(struct fd_context *ctx, struct fd_ringbuffer *ring,
+                       unsigned flushes);
+ 
++template <chip CHIP>
+ void fd6_barrier_flush(struct fd_batch *batch) assert_dt;
+ 
+ void fd6_barrier_init(struct pipe_context *pctx);
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_blitter.cc b/src/gallium/drivers/freedreno/a6xx/fd6_blitter.cc
+index ff8918f3d89..1e2ee9de6c0 100644
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_blitter.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_blitter.cc
+@@ -247,17 +247,18 @@ can_do_clear(const struct pipe_resource *prsc, unsigned level,
+    return true;
+ }
+ 
++template <chip CHIP>
+ static void
+ emit_setup(struct fd_batch *batch)
+ {
+    struct fd_ringbuffer *ring = batch->draw;
+    struct fd_screen *screen = batch->ctx->screen;
+ 
+-   fd6_emit_flushes(batch->ctx, ring,
+-                    FD6_FLUSH_CCU_COLOR |
+-                    FD6_INVALIDATE_CCU_COLOR |
+-                    FD6_FLUSH_CCU_DEPTH |
+-                    FD6_INVALIDATE_CCU_DEPTH);
++   fd6_emit_flushes<CHIP>(batch->ctx, ring,
++                          FD6_FLUSH_CCU_COLOR |
++                          FD6_INVALIDATE_CCU_COLOR |
++                          FD6_FLUSH_CCU_DEPTH |
++                          FD6_INVALIDATE_CCU_DEPTH);
+ 
+    /* normal BLIT_OP_SCALE operation needs bypass RB_CCU_CNTL */
+    OUT_WFI5(ring);
+@@ -445,8 +446,7 @@ emit_blit_buffer(struct fd_context *ctx, struct fd_ringbuffer *ring,
+       OUT_RING(ring, A6XX_GRAS_2D_DST_BR_X(dshift + w - 1) |
+                         A6XX_GRAS_2D_DST_BR_Y(0));
+ 
+-      OUT_PKT7(ring, CP_EVENT_WRITE, 1);
+-      OUT_RING(ring, LABEL);
++      fd6_event_write<CHIP>(ctx, ring, FD_LABEL);
+       OUT_WFI5(ring);
+ 
+       OUT_PKT4(ring, REG_A6XX_RB_DBG_ECO_CNTL, 1);
+@@ -524,8 +524,7 @@ fd6_clear_ubwc(struct fd_batch *batch, struct fd_resource *rsc) assert_dt
+       OUT_RING(ring,
+                A6XX_GRAS_2D_DST_BR_X(w - 1) | A6XX_GRAS_2D_DST_BR_Y(h - 1));
+ 
+-      OUT_PKT7(ring, CP_EVENT_WRITE, 1);
+-      OUT_RING(ring, LABEL);
++      fd6_event_write<CHIP>(batch->ctx, ring, FD_LABEL);
+       OUT_WFI5(ring);
+ 
+       OUT_PKT4(ring, REG_A6XX_RB_DBG_ECO_CNTL, 1);
+@@ -543,11 +542,11 @@ fd6_clear_ubwc(struct fd_batch *batch, struct fd_resource *rsc) assert_dt
+       size -= w * h;
+    }
+ 
+-   fd6_emit_flushes(batch->ctx, ring,
+-                    FD6_FLUSH_CCU_COLOR |
+-                    FD6_FLUSH_CCU_DEPTH |
+-                    FD6_FLUSH_CACHE |
+-                    FD6_WAIT_FOR_IDLE);
++   fd6_emit_flushes<CHIP>(batch->ctx, ring,
++                          FD6_FLUSH_CCU_COLOR |
++                          FD6_FLUSH_CCU_DEPTH |
++                          FD6_FLUSH_CACHE |
++                          FD6_WAIT_FOR_IDLE);
+ }
+ 
+ static void
+@@ -729,8 +728,7 @@ emit_blit_texture(struct fd_context *ctx, struct fd_ringbuffer *ring,
+       /*
+        * Blit command:
+        */
+-      OUT_PKT7(ring, CP_EVENT_WRITE, 1);
+-      OUT_RING(ring, LABEL);
++      fd6_event_write<CHIP>(ctx, ring, FD_LABEL);
+       OUT_WFI5(ring);
+ 
+       OUT_PKT4(ring, REG_A6XX_RB_DBG_ECO_CNTL, 1);
+@@ -903,8 +901,7 @@ fd6_clear_surface(struct fd_context *ctx, struct fd_ringbuffer *ring,
+       /*
+        * Blit command:
+        */
+-      OUT_PKT7(ring, CP_EVENT_WRITE, 1);
+-      OUT_RING(ring, LABEL);
++      fd6_event_write<CHIP>(ctx, ring, FD_LABEL);
+       OUT_WFI5(ring);
+ 
+       OUT_PKT4(ring, REG_A6XX_RB_DBG_ECO_CNTL, 1);
+@@ -980,7 +977,7 @@ fd6_clear_texture(struct pipe_context *pctx, struct pipe_resource *prsc,
+ 
+    fd_batch_update_queries(batch);
+ 
+-   emit_setup(batch);
++   emit_setup<CHIP>(batch);
+ 
+    struct pipe_surface surf = {
+          .format = prsc->format,
+@@ -996,11 +993,11 @@ fd6_clear_texture(struct pipe_context *pctx, struct pipe_resource *prsc,
+ 
+    fd6_clear_surface<CHIP>(ctx, batch->draw, &surf, box, &color, 0);
+ 
+-   fd6_emit_flushes(batch->ctx, batch->draw,
+-                    FD6_FLUSH_CCU_COLOR |
+-                    FD6_FLUSH_CCU_DEPTH |
+-                    FD6_FLUSH_CACHE |
+-                    FD6_WAIT_FOR_IDLE);
++   fd6_emit_flushes<CHIP>(batch->ctx, batch->draw,
++                          FD6_FLUSH_CCU_COLOR |
++                          FD6_FLUSH_CCU_DEPTH |
++                          FD6_FLUSH_CACHE |
++                          FD6_WAIT_FOR_IDLE);
+ 
+    fd_batch_flush(batch);
+    fd_batch_reference(&batch, NULL);
+@@ -1075,7 +1072,7 @@ fd6_resolve_tile(struct fd_batch *batch, struct fd_ringbuffer *ring,
+    );
+ 
+    /* sync GMEM writes with CACHE. */
+-   fd6_cache_inv(batch, ring);
++   fd6_cache_inv<CHIP>(batch->ctx, ring);
+ 
+    /* Wait for CACHE_INVALIDATE to land */
+    OUT_WFI5(ring);
+@@ -1089,8 +1086,8 @@ fd6_resolve_tile(struct fd_batch *batch, struct fd_ringbuffer *ring,
+     * sysmem, and we generally assume that GMEM renderpasses leave their
+     * results in sysmem, so we need to flush manually here.
+     */
+-   fd6_emit_flushes(batch->ctx, ring,
+-                    FD6_FLUSH_CCU_COLOR | FD6_WAIT_FOR_IDLE);
++   fd6_emit_flushes<CHIP>(batch->ctx, ring,
++                          FD6_FLUSH_CCU_COLOR | FD6_WAIT_FOR_IDLE);
+ }
+ FD_GENX(fd6_resolve_tile);
+ 
+@@ -1131,7 +1128,7 @@ handle_rgba_blit(struct fd_context *ctx, const struct pipe_blit_info *info)
+ 
+    fd_batch_update_queries(batch);
+ 
+-   emit_setup(batch);
++   emit_setup<CHIP>(batch);
+ 
+    DBG_BLIT(info, batch);
+ 
+@@ -1152,11 +1149,11 @@ handle_rgba_blit(struct fd_context *ctx, const struct pipe_blit_info *info)
+ 
+    trace_end_blit(&batch->trace, batch->draw);
+ 
+-   fd6_emit_flushes(batch->ctx, batch->draw,
+-                    FD6_FLUSH_CCU_COLOR |
+-                    FD6_FLUSH_CCU_DEPTH |
+-                    FD6_FLUSH_CACHE |
+-                    FD6_WAIT_FOR_IDLE);
++   fd6_emit_flushes<CHIP>(batch->ctx, batch->draw,
++                          FD6_FLUSH_CCU_COLOR |
++                          FD6_FLUSH_CCU_DEPTH |
++                          FD6_FLUSH_CACHE |
++                          FD6_WAIT_FOR_IDLE);
+ 
+    fd_batch_flush(batch);
+    fd_batch_reference(&batch, NULL);
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_compute.cc b/src/gallium/drivers/freedreno/a6xx/fd6_compute.cc
+index 2d0ec85e16c..4265c4d7685 100644
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_compute.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_compute.cc
+@@ -130,7 +130,7 @@ fd6_launch_grid(struct fd_context *ctx, const struct pipe_grid_info *info) in_dt
+                        cs->v->shader_id);
+ 
+    if (ctx->batch->barrier)
+-      fd6_barrier_flush(ctx->batch);
++      fd6_barrier_flush<CHIP>(ctx->batch);
+ 
+    bool emit_instrlen_workaround =
+       cs->v->instrlen > ctx->screen->info->a6xx.instr_cache_size;
+@@ -152,7 +152,7 @@ fd6_launch_grid(struct fd_context *ctx, const struct pipe_grid_info *info) in_dt
+     */
+    if (emit_instrlen_workaround) {
+       OUT_REG(ring, A6XX_SP_FS_INSTRLEN(cs->v->instrlen));
+-      fd6_event_write(ctx->batch, ring, LABEL, false);
++      fd6_event_write<CHIP>(ctx, ring, FD_LABEL);
+    }
+ 
+    if (ctx->gen_dirty)
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_context.cc b/src/gallium/drivers/freedreno/a6xx/fd6_context.cc
+index 45c84b2be5e..b01481852c1 100644
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_context.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_context.cc
+@@ -275,7 +275,7 @@ fd6_context_create(struct pipe_screen *pscreen, void *priv,
+    fd6_gmem_init<CHIP>(pctx);
+    fd6_texture_init(pctx);
+    fd6_prog_init<CHIP>(pctx);
+-   fd6_query_context_init(pctx);
++   fd6_query_context_init<CHIP>(pctx);
+ 
+    setup_state_map(&fd6_ctx->base);
+ 
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc b/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
+index e5b772965b2..b2c7efdd8f7 100644
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
+@@ -275,6 +275,7 @@ get_program_state(struct fd_context *ctx, const struct pipe_draw_info *info)
+    return fd6_ctx->prog;
+ }
+ 
++template <chip CHIP>
+ static void
+ flush_streamout(struct fd_context *ctx, struct fd6_emit *emit)
+    assert_dt
+@@ -286,8 +287,8 @@ flush_streamout(struct fd_context *ctx, struct fd6_emit *emit)
+ 
+    for (unsigned i = 0; i < PIPE_MAX_SO_BUFFERS; i++) {
+       if (emit->streamout_mask & (1 << i)) {
+-         enum vgt_event_type evt = (enum vgt_event_type)(FLUSH_SO_0 + i);
+-         fd6_event_write(ctx->batch, ring, evt, false);
++         enum fd_gpu_event evt = (enum fd_gpu_event)(FD_FLUSH_SO_0 + i);
++         fd6_event_write<CHIP>(ctx, ring, evt);
+       }
+    }
+ }
+@@ -463,7 +464,7 @@ draw_vbos(struct fd_context *ctx, const struct pipe_draw_info *info,
+       ctx->batch->barrier |= FD6_WAIT_FOR_ME;
+ 
+    if (ctx->batch->barrier)
+-      fd6_barrier_flush(ctx->batch);
++      fd6_barrier_flush<CHIP>(ctx->batch);
+ 
+    /* for debug after a lock up, write a unique counter value
+     * to scratch7 for each draw, to make it easier to match up
+@@ -507,7 +508,7 @@ draw_vbos(struct fd_context *ctx, const struct pipe_draw_info *info,
+          uint32_t last_index_start = ctx->last.index_start;
+ 
+          for (unsigned i = 1; i < num_draws; i++) {
+-            flush_streamout(ctx, &emit);
++            flush_streamout<CHIP>(ctx, &emit);
+ 
+             fd6_vsc_update_sizes(ctx->batch, info, &draws[i]);
+ 
+@@ -536,7 +537,7 @@ draw_vbos(struct fd_context *ctx, const struct pipe_draw_info *info,
+ 
+    emit_marker6(ring, 7);
+ 
+-   flush_streamout(ctx, &emit);
++   flush_streamout<CHIP>(ctx, &emit);
+ 
+    fd_context_all_clean(ctx);
+ }
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_emit.cc b/src/gallium/drivers/freedreno/a6xx/fd6_emit.cc
+index c1a35a4d2f2..de44a9b9398 100644
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_emit.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_emit.cc
+@@ -833,7 +833,7 @@ fd6_emit_restore(struct fd_batch *batch, struct fd_ringbuffer *ring)
+    OUT_PKT7(ring, CP_SET_MODE, 1);
+    OUT_RING(ring, 0);
+ 
+-   fd6_cache_inv(batch, ring);
++   fd6_cache_inv<CHIP>(batch->ctx, ring);
+ 
+    OUT_REG(ring,
+            HLSQ_INVALIDATE_CMD(CHIP, .vs_state = true, .hs_state = true,
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_emit.h b/src/gallium/drivers/freedreno/a6xx/fd6_emit.h
+index c8ca7239e9c..4a456bdc144 100644
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_emit.h
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_emit.h
+@@ -34,6 +34,7 @@
+ #include "fd6_program.h"
+ #include "fdl/fd6_format_table.h"
+ #include "freedreno_context.h"
++#include "freedreno_gpu_event.h"
+ #include "ir3_gallium.h"
+ 
+ struct fd_ringbuffer;
+@@ -216,39 +217,89 @@ fd6_emit_get_prog(struct fd6_emit *emit)
+    return emit->prog;
+ }
+ 
++template <chip CHIP>
++static inline void
++__event_write(struct fd_ringbuffer *ring, enum fd_gpu_event event,
++              enum event_write_src esrc, enum event_write_dst edst, uint32_t val,
++              struct fd_bo *bo, uint32_t offset, uint64_t orval, int32_t shift)
++{
++   struct fd_gpu_event_info info = fd_gpu_events<CHIP>[event];
++   unsigned len = info.needs_seqno ? 4 : 1;
++
++   if (CHIP == A6XX) {
++      OUT_PKT7(ring, CP_EVENT_WRITE, len);
++      OUT_RING(ring, CP_EVENT_WRITE_0_EVENT(info.raw_event));
++   } else if (CHIP == A7XX) {
++      if (event == FD_RB_DONE)
++         len--;
++      OUT_PKT7(ring, CP_EVENT_WRITE, len);
++      OUT_RING(ring, CP_EVENT_WRITE7_0_EVENT(info.raw_event) |
++               CP_EVENT_WRITE7_0_WRITE_SRC(esrc) |
++               CP_EVENT_WRITE7_0_WRITE_DST(edst) |
++               CP_EVENT_WRITE7_0_WRITE_ENABLED);
++   }
++
++   if (info.needs_seqno) {
++      OUT_RELOC(ring, bo, offset, orval, shift); /* ADDR_LO/HI */
++      if (len == 4)
++         OUT_RING(ring, val);
++   }
++}
++
++template <chip CHIP>
++static inline void
++fd6_record_ts(struct fd_ringbuffer *ring, struct fd_bo *bo, uint32_t offset,
++              uint64_t orval, int32_t shift)
++{
++   __event_write<CHIP>(ring, FD_RB_DONE, EV_WRITE_ALWAYSON, EV_DST_RAM, 0,
++                       bo, offset, orval, shift);
++}
++
++template <chip CHIP>
++static inline void
++fd6_fence_write(struct fd_ringbuffer *ring, uint32_t val, struct fd_bo *bo,
++                uint32_t offset, uint64_t orval, int32_t shift)
++{
++   __event_write<CHIP>(ring, FD_CACHE_CLEAN, EV_WRITE_USER_32B, EV_DST_RAM, val,
++                       bo, offset, orval, shift);
++}
++
++template <chip CHIP>
+ static inline unsigned
+-fd6_event_write(struct fd_batch *batch, struct fd_ringbuffer *ring,
+-                enum vgt_event_type evt, bool timestamp)
++fd6_event_write(struct fd_context *ctx, struct fd_ringbuffer *ring, enum fd_gpu_event event)
+ {
++   struct fd6_context *fd6_ctx = fd6_context(ctx);
++   struct fd_gpu_event_info info = fd_gpu_events<CHIP>[event];
+    unsigned seqno = 0;
+ 
+-   OUT_PKT7(ring, CP_EVENT_WRITE, timestamp ? 4 : 1);
+-   OUT_RING(ring, CP_EVENT_WRITE_0_EVENT(evt));
+-   if (timestamp) {
+-      struct fd6_context *fd6_ctx = fd6_context(batch->ctx);
++   if (info.needs_seqno) {
++      struct fd6_context *fd6_ctx = fd6_context(ctx);
+       seqno = ++fd6_ctx->seqno;
+-      OUT_RELOC(ring, control_ptr(fd6_ctx, seqno)); /* ADDR_LO/HI */
+-      OUT_RING(ring, seqno);
+    }
+ 
++   __event_write<CHIP>(ring, event, EV_WRITE_USER_32B, EV_DST_RAM, seqno,
++                       control_ptr(fd6_ctx, seqno));
++
+    return seqno;
+ }
+ 
++template <chip CHIP>
+ static inline void
+-fd6_cache_inv(struct fd_batch *batch, struct fd_ringbuffer *ring)
++fd6_cache_inv(struct fd_context *ctx, struct fd_ringbuffer *ring)
+ {
+-   fd6_event_write(batch, ring, PC_CCU_INVALIDATE_COLOR, false);
+-   fd6_event_write(batch, ring, PC_CCU_INVALIDATE_DEPTH, false);
+-   fd6_event_write(batch, ring, CACHE_INVALIDATE, false);
++   fd6_event_write<CHIP>(ctx, ring, FD_CCU_INVALIDATE_COLOR);
++   fd6_event_write<CHIP>(ctx, ring, FD_CCU_INVALIDATE_DEPTH);
++   fd6_event_write<CHIP>(ctx, ring, FD_CACHE_INVALIDATE);
+ }
+ 
++template <chip CHIP>
+ static inline void
+-fd6_cache_flush(struct fd_batch *batch, struct fd_ringbuffer *ring)
++fd6_cache_flush(struct fd_context *ctx, struct fd_ringbuffer *ring)
+ {
+-   struct fd6_context *fd6_ctx = fd6_context(batch->ctx);
++   struct fd6_context *fd6_ctx = fd6_context(ctx);
+    unsigned seqno;
+ 
+-   seqno = fd6_event_write(batch, ring, RB_DONE_TS, true);
++   seqno = fd6_event_write<CHIP>(ctx, ring, FD_RB_DONE);
+ 
+    OUT_PKT7(ring, CP_WAIT_REG_MEM, 6);
+    OUT_RING(ring, CP_WAIT_REG_MEM_0_FUNCTION(WRITE_EQ) |
+@@ -258,7 +309,7 @@ fd6_cache_flush(struct fd_batch *batch, struct fd_ringbuffer *ring)
+    OUT_RING(ring, CP_WAIT_REG_MEM_4_MASK(~0));
+    OUT_RING(ring, CP_WAIT_REG_MEM_5_DELAY_LOOP_CYCLES(16));
+ 
+-   seqno = fd6_event_write(batch, ring, CACHE_FLUSH_TS, true);
++   seqno = fd6_event_write<CHIP>(ctx, ring, FD_CACHE_CLEAN);
+ 
+    OUT_PKT7(ring, CP_WAIT_MEM_GTE, 4);
+    OUT_RING(ring, CP_WAIT_MEM_GTE_0_RESERVED(0));
+@@ -266,21 +317,15 @@ fd6_cache_flush(struct fd_batch *batch, struct fd_ringbuffer *ring)
+    OUT_RING(ring, CP_WAIT_MEM_GTE_3_REF(seqno));
+ }
+ 
++template <chip CHIP>
+ static inline void
+-fd6_emit_blit(struct fd_batch *batch, struct fd_ringbuffer *ring)
++fd6_emit_blit(struct fd_context *ctx, struct fd_ringbuffer *ring)
+ {
+    emit_marker6(ring, 7);
+-   fd6_event_write(batch, ring, BLIT, false);
++   fd6_event_write<CHIP>(ctx, ring, FD_BLIT);
+    emit_marker6(ring, 7);
+ }
+ 
+-static inline void
+-fd6_emit_lrz_flush(struct fd_ringbuffer *ring)
+-{
+-   OUT_PKT7(ring, CP_EVENT_WRITE, 1);
+-   OUT_RING(ring, LRZ_FLUSH);
+-}
+-
+ static inline bool
+ fd6_geom_stage(gl_shader_stage type)
+ {
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_gmem.cc b/src/gallium/drivers/freedreno/a6xx/fd6_gmem.cc
+index 0e47359a2ed..f23de8f4a92 100644
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_gmem.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_gmem.cc
+@@ -161,8 +161,8 @@ emit_mrt(struct fd_ringbuffer *ring, struct pipe_framebuffer_state *pfb,
+ 
+ template <chip CHIP>
+ static void
+-emit_zs(struct fd_ringbuffer *ring, struct pipe_surface *zsbuf,
+-        const struct fd_gmem_stateobj *gmem)
++emit_zs(struct fd_context *ctx, struct fd_ringbuffer *ring,
++        struct pipe_surface *zsbuf, const struct fd_gmem_stateobj *gmem)
+ {
+    if (zsbuf) {
+       struct fd_resource *rsc = fd_resource(zsbuf->texture);
+@@ -212,8 +212,7 @@ emit_zs(struct fd_ringbuffer *ring, struct pipe_surface *zsbuf,
+          /* NOTE: blob emits GRAS_LRZ_CNTL plus GRAZ_LRZ_BUFFER_BASE
+           * plus this CP_EVENT_WRITE at the end in it's own IB..
+           */
+-         OUT_PKT7(ring, CP_EVENT_WRITE, 1);
+-         OUT_RING(ring, CP_EVENT_WRITE_0_EVENT(LRZ_CLEAR));
++         fd6_event_write<CHIP>(ctx, ring, FD_LRZ_CLEAR);
+       }
+ 
+       if (stencil) {
+@@ -259,6 +258,7 @@ emit_zs(struct fd_ringbuffer *ring, struct pipe_surface *zsbuf,
+    }
+ }
+ 
++template <chip CHIP>
+ static void
+ emit_lrz(struct fd_batch *batch, struct fd_batch_subpass *subpass)
+ {
+@@ -278,7 +278,7 @@ emit_lrz(struct fd_batch *batch, struct fd_batch_subpass *subpass)
+     * we change the LRZ buffer after a sub-pass, but get a
+     * cache-hit on stale data from the previous LRZ buffer.
+     */
+-   fd6_emit_lrz_flush(ring);
++   fd6_event_write<CHIP>(batch->ctx, ring, FD_LRZ_FLUSH);
+ 
+    struct fd_resource *zsbuf = fd_resource(pfb->zsbuf->texture);
+    OUT_REG(ring, A6XX_GRAS_LRZ_BUFFER_BASE(.bo = subpass->lrz),
+@@ -324,7 +324,7 @@ emit_lrz_clears(struct fd_batch *batch)
+          OUT_PKT7(ring, CP_SET_MARKER, 1);
+          OUT_RING(ring, A6XX_CP_SET_MARKER_0_MODE(RM6_BLIT2DSCALE));
+ 
+-         fd6_emit_flushes(ctx, ring, FD6_FLUSH_CACHE);
++         fd6_emit_flushes<CHIP>(ctx, ring, FD6_FLUSH_CACHE);
+ 
+          if (ctx->screen->info->a6xx.magic.RB_DBG_ECO_CNTL_blit !=
+              ctx->screen->info->a6xx.magic.RB_DBG_ECO_CNTL) {
+@@ -358,9 +358,9 @@ emit_lrz_clears(struct fd_batch *batch)
+        * has_ccu_flush_bug (and it is added by fd6_emit_flushes() already
+        * in that case)
+        */
+-      fd6_emit_flushes(batch->ctx, ring,
+-                       FD6_FLUSH_CCU_COLOR |
+-                       FD6_INVALIDATE_CACHE);
++      fd6_emit_flushes<CHIP>(batch->ctx, ring,
++                             FD6_FLUSH_CCU_COLOR |
++                             FD6_INVALIDATE_CACHE);
+    }
+ }
+ 
+@@ -723,6 +723,7 @@ check_vsc_overflow(struct fd_context *ctx)
+    }
+ }
+ 
++template <chip CHIP>
+ static void
+ emit_common_init(struct fd_batch *batch)
+ {
+@@ -741,9 +742,10 @@ emit_common_init(struct fd_batch *batch)
+    OUT_PKT4(ring, REG_A6XX_RB_SAMPLE_COUNT_ADDR, 2);
+    OUT_RELOC(ring, results_ptr(at, result[result->idx].samples_start));
+ 
+-   fd6_event_write(batch, ring, ZPASS_DONE, false);
++   fd6_event_write<CHIP>(batch->ctx, ring, FD_ZPASS_DONE);
+ }
+ 
++template <chip CHIP>
+ static void
+ emit_common_fini(struct fd_batch *batch)
+ {
+@@ -751,7 +753,7 @@ emit_common_fini(struct fd_batch *batch)
+    struct fd_autotune *at = &batch->ctx->autotune;
+    struct fd_batch_result *result = batch->autotune_result;
+ 
+-   fd6_emit_flushes(batch->ctx, ring, batch->barrier);
++   fd6_emit_flushes<CHIP>(batch->ctx, ring, batch->barrier);
+ 
+    if (!result)
+       return;
+@@ -765,13 +767,8 @@ emit_common_fini(struct fd_batch *batch)
+    OUT_PKT4(ring, REG_A6XX_RB_SAMPLE_COUNT_ADDR, 2);
+    OUT_RELOC(ring, results_ptr(at, result[result->idx].samples_end));
+ 
+-   fd6_event_write(batch, ring, ZPASS_DONE, false);
+-
+-   // TODO is there a better event to use.. a single ZPASS_DONE_TS would be nice
+-   OUT_PKT7(ring, CP_EVENT_WRITE, 4);
+-   OUT_RING(ring, CP_EVENT_WRITE_0_EVENT(CACHE_FLUSH_TS));
+-   OUT_RELOC(ring, results_ptr(at, fence));
+-   OUT_RING(ring, result->fence);
++   fd6_event_write<CHIP>(batch->ctx, ring, FD_ZPASS_DONE);
++   fd6_fence_write<CHIP>(ring, result->fence, results_ptr(at, fence));
+ }
+ 
+ /*
+@@ -869,6 +866,7 @@ set_bin_size(struct fd_ringbuffer *ring, const struct fd_gmem_stateobj *gmem,
+    OUT_REG(ring, A6XX_RB_BIN_CONTROL2(.binw = w, .binh = h));
+ }
+ 
++template <chip CHIP>
+ static void
+ emit_binning_pass(struct fd_batch *batch) assert_dt
+ {
+@@ -916,7 +914,7 @@ emit_binning_pass(struct fd_batch *batch) assert_dt
+    /* emit IB to binning drawcmds: */
+    trace_start_binning_ib(&batch->trace, ring);
+    foreach_subpass (subpass, batch) {
+-      emit_lrz(batch, subpass);
++      emit_lrz<CHIP>(batch, subpass);
+       fd6_emit_ib(ring, subpass->draw);
+    }
+    trace_end_binning_ib(&batch->trace, ring);
+@@ -939,10 +937,10 @@ emit_binning_pass(struct fd_batch *batch) assert_dt
+     * emit_vsc_overflow_test) or the VSC_DATA buffer directly (implicitly
+     * as part of draws).
+     */
+-   fd6_emit_flushes(batch->ctx, ring,
+-                    FD6_FLUSH_CACHE |
+-                    FD6_WAIT_FOR_IDLE |
+-                    FD6_WAIT_FOR_ME);
++   fd6_emit_flushes<CHIP>(batch->ctx, ring,
++                          FD6_FLUSH_CACHE |
++                          FD6_WAIT_FOR_IDLE |
++                          FD6_WAIT_FOR_ME);
+ 
+    trace_start_vsc_overflow_test(&batch->trace, batch->gmem);
+    emit_vsc_overflow_test(batch);
+@@ -986,6 +984,7 @@ emit_msaa(struct fd_ringbuffer *ring, unsigned nr)
+    OUT_RING(ring, A6XX_RB_BLIT_GMEM_MSAA_CNTL_SAMPLES(samples));
+ }
+ 
++template <chip CHIP>
+ static void prepare_tile_setup(struct fd_batch *batch);
+ template <chip CHIP>
+ static void prepare_tile_fini(struct fd_batch *batch);
+@@ -1004,7 +1003,7 @@ fd6_emit_tile_init(struct fd_batch *batch) assert_dt
+ 
+    fd6_emit_restore<CHIP>(batch, ring);
+ 
+-   fd6_emit_lrz_flush(ring);
++   fd6_event_write<CHIP>(batch->ctx, ring, FD_LRZ_FLUSH);
+ 
+    if (batch->prologue) {
+       trace_start_prologue(&batch->trace, ring);
+@@ -1012,9 +1011,9 @@ fd6_emit_tile_init(struct fd_batch *batch) assert_dt
+       trace_end_prologue(&batch->trace, ring);
+    }
+ 
+-   fd6_cache_inv(batch, ring);
++   fd6_cache_inv<CHIP>(batch->ctx, ring);
+ 
+-   prepare_tile_setup(batch);
++   prepare_tile_setup<CHIP>(batch);
+    prepare_tile_fini<CHIP>(batch);
+ 
+    OUT_PKT7(ring, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
+@@ -1027,7 +1026,7 @@ fd6_emit_tile_init(struct fd_batch *batch) assert_dt
+    OUT_WFI5(ring);
+    fd6_emit_ccu_cntl(ring, screen, true);
+ 
+-   emit_zs<CHIP>(ring, pfb->zsbuf, batch->gmem_state);
++   emit_zs<CHIP>(batch->ctx, ring, pfb->zsbuf, batch->gmem_state);
+    emit_mrt<CHIP>(ring, pfb, batch->gmem_state);
+    emit_msaa(ring, pfb->samples);
+    patch_fb_read_gmem(batch);
+@@ -1042,7 +1041,7 @@ fd6_emit_tile_init(struct fd_batch *batch) assert_dt
+             .lrz_feedback_zmode_mask = 0x6,
+       });
+       update_render_cntl<CHIP>(batch, pfb, true);
+-      emit_binning_pass(batch);
++      emit_binning_pass<CHIP>(batch);
+ 
+       /* and disable stream-out for draw pass: */
+       OUT_REG(ring, A6XX_VPC_SO_DISABLE(true));
+@@ -1085,7 +1084,7 @@ fd6_emit_tile_init(struct fd_batch *batch) assert_dt
+ 
+    update_render_cntl<CHIP>(batch, pfb, false);
+ 
+-   emit_common_init(batch);
++   emit_common_init<CHIP>(batch);
+ }
+ 
+ template <chip CHIP>
+@@ -1192,6 +1191,7 @@ set_blit_scissor(struct fd_batch *batch, struct fd_ringbuffer *ring)
+                      A6XX_RB_BLIT_SCISSOR_BR_Y(blit_scissor.maxy - 1));
+ }
+ 
++template <chip CHIP>
+ static void
+ emit_blit(struct fd_batch *batch, struct fd_ringbuffer *ring, uint32_t base,
+           struct pipe_surface *psurf, bool stencil)
+@@ -1244,9 +1244,10 @@ emit_blit(struct fd_batch *batch, struct fd_ringbuffer *ring, uint32_t base,
+                               psurf->u.tex.first_layer);
+    }
+ 
+-   fd6_emit_blit(batch, ring);
++   fd6_emit_blit<CHIP>(batch->ctx, ring);
+ }
+ 
++template <chip CHIP>
+ static void
+ emit_restore_blit(struct fd_batch *batch, struct fd_ringbuffer *ring,
+                   uint32_t base, struct pipe_surface *psurf, unsigned buffer)
+@@ -1262,9 +1263,10 @@ emit_restore_blit(struct fd_batch *batch, struct fd_ringbuffer *ring,
+            ),
+    );
+ 
+-   emit_blit(batch, ring, base, psurf, stencil);
++   emit_blit<CHIP>(batch, ring, base, psurf, stencil);
+ }
+ 
++template <chip CHIP>
+ static void
+ emit_subpass_clears(struct fd_batch *batch, struct fd_batch_subpass *subpass)
+ {
+@@ -1342,7 +1344,7 @@ emit_subpass_clears(struct fd_batch *batch, struct fd_batch_subpass *subpass)
+          OUT_RING(ring, uc.ui[2]);
+          OUT_RING(ring, uc.ui[3]);
+ 
+-         fd6_emit_blit(batch, ring);
++         fd6_emit_blit<CHIP>(batch->ctx, ring);
+       }
+    }
+ 
+@@ -1393,7 +1395,7 @@ emit_subpass_clears(struct fd_batch *batch, struct fd_batch_subpass *subpass)
+       OUT_PKT4(ring, REG_A6XX_RB_BLIT_CLEAR_COLOR_DW0, 1);
+       OUT_RING(ring, clear_value);
+ 
+-      fd6_emit_blit(batch, ring);
++      fd6_emit_blit<CHIP>(batch->ctx, ring);
+    }
+ 
+    /* Then clear the separate stencil buffer in case of 32 bit depth
+@@ -1419,13 +1421,14 @@ emit_subpass_clears(struct fd_batch *batch, struct fd_batch_subpass *subpass)
+       OUT_PKT4(ring, REG_A6XX_RB_BLIT_CLEAR_COLOR_DW0, 1);
+       OUT_RING(ring, subpass->clear_stencil & 0xff);
+ 
+-      fd6_emit_blit(batch, ring);
++      fd6_emit_blit<CHIP>(batch->ctx, ring);
+    }
+ }
+ 
+ /*
+  * transfer from system memory to gmem
+  */
++template <chip CHIP>
+ static void
+ emit_restore_blits(struct fd_batch *batch, struct fd_ringbuffer *ring)
+ {
+@@ -1439,8 +1442,8 @@ emit_restore_blits(struct fd_batch *batch, struct fd_ringbuffer *ring)
+             continue;
+          if (!(batch->restore & (PIPE_CLEAR_COLOR0 << i)))
+             continue;
+-         emit_restore_blit(batch, ring, gmem->cbuf_base[i], pfb->cbufs[i],
+-                           FD_BUFFER_COLOR);
++         emit_restore_blit<CHIP>(batch, ring, gmem->cbuf_base[i], pfb->cbufs[i],
++                                 FD_BUFFER_COLOR);
+       }
+    }
+ 
+@@ -1448,16 +1451,17 @@ emit_restore_blits(struct fd_batch *batch, struct fd_ringbuffer *ring)
+       struct fd_resource *rsc = fd_resource(pfb->zsbuf->texture);
+ 
+       if (!rsc->stencil || (batch->restore & FD_BUFFER_DEPTH)) {
+-         emit_restore_blit(batch, ring, gmem->zsbuf_base[0], pfb->zsbuf,
+-                           FD_BUFFER_DEPTH);
++         emit_restore_blit<CHIP>(batch, ring, gmem->zsbuf_base[0], pfb->zsbuf,
++                                 FD_BUFFER_DEPTH);
+       }
+       if (rsc->stencil && (batch->restore & FD_BUFFER_STENCIL)) {
+-         emit_restore_blit(batch, ring, gmem->zsbuf_base[1], pfb->zsbuf,
+-                           FD_BUFFER_STENCIL);
++         emit_restore_blit<CHIP>(batch, ring, gmem->zsbuf_base[1], pfb->zsbuf,
++                                 FD_BUFFER_STENCIL);
+       }
+    }
+ }
+ 
++template <chip CHIP>
+ static void
+ prepare_tile_setup(struct fd_batch *batch)
+ {
+@@ -1466,7 +1470,7 @@ prepare_tile_setup(struct fd_batch *batch)
+          fd_submit_new_ringbuffer(batch->submit, 0x1000, FD_RINGBUFFER_STREAMING);
+ 
+       set_blit_scissor(batch, batch->tile_loads);
+-      emit_restore_blits(batch, batch->tile_loads);
++      emit_restore_blits<CHIP>(batch, batch->tile_loads);
+    }
+ 
+    foreach_subpass (subpass, batch) {
+@@ -1477,7 +1481,7 @@ prepare_tile_setup(struct fd_batch *batch)
+          fd_submit_new_ringbuffer(batch->submit, 0x1000, FD_RINGBUFFER_STREAMING);
+ 
+       set_blit_scissor(batch, subpass->subpass_clears);
+-      emit_subpass_clears(batch, subpass);
++      emit_subpass_clears<CHIP>(batch, subpass);
+    }
+ }
+ 
+@@ -1609,7 +1613,7 @@ emit_resolve_blit(struct fd_batch *batch, struct fd_ringbuffer *ring,
+    OUT_PKT4(ring, REG_A6XX_RB_BLIT_INFO, 1);
+    OUT_RING(ring, info);
+ 
+-   emit_blit(batch, ring, base, psurf, stencil);
++   emit_blit<CHIP>(batch, ring, base, psurf, stencil);
+ }
+ 
+ /*
+@@ -1657,6 +1661,7 @@ prepare_tile_fini(struct fd_batch *batch)
+    }
+ }
+ 
++template <chip CHIP>
+ static void
+ fd6_emit_tile(struct fd_batch *batch, const struct fd_tile *tile)
+ {
+@@ -1667,7 +1672,7 @@ fd6_emit_tile(struct fd_batch *batch, const struct fd_tile *tile)
+          trace_end_clears(&batch->trace, batch->gmem);
+       }
+ 
+-      emit_lrz(batch, subpass);
++      emit_lrz<CHIP>(batch, subpass);
+ 
+       fd6_emit_ib(batch->gmem, subpass->draw);
+    }
+@@ -1711,19 +1716,19 @@ fd6_emit_tile_gmem2mem(struct fd_batch *batch, const struct fd_tile *tile)
+    }
+ }
+ 
++template <chip CHIP>
+ static void
+ fd6_emit_tile_fini(struct fd_batch *batch)
+ {
+    struct fd_ringbuffer *ring = batch->gmem;
+ 
+-   emit_common_fini(batch);
++   emit_common_fini<CHIP>(batch);
+ 
+    OUT_PKT4(ring, REG_A6XX_GRAS_LRZ_CNTL, 1);
+    OUT_RING(ring, A6XX_GRAS_LRZ_CNTL_ENABLE);
+ 
+-   fd6_emit_lrz_flush(ring);
+-
+-   fd6_event_write(batch, ring, PC_CCU_RESOLVE_TS, true);
++   fd6_event_write<CHIP>(batch->ctx, ring, FD_LRZ_FLUSH);
++   fd6_event_write<CHIP>(batch->ctx, ring, FD_CCU_CLEAN_BLIT_CACHE);
+ 
+    if (use_hw_binning(batch)) {
+       check_vsc_overflow(batch->ctx);
+@@ -1789,7 +1794,7 @@ emit_sysmem_clears(struct fd_batch *batch, struct fd_batch_subpass *subpass)
+       }
+    }
+ 
+-   fd6_emit_flushes(ctx, ring, FD6_FLUSH_CCU_COLOR | FD6_INVALIDATE_CCU_COLOR);
++   fd6_emit_flushes<CHIP>(ctx, ring, FD6_FLUSH_CCU_COLOR | FD6_INVALIDATE_CCU_COLOR);
+ 
+    trace_end_clears(&batch->trace, ring);
+ }
+@@ -1803,7 +1808,7 @@ fd6_emit_sysmem_prep(struct fd_batch *batch) assert_dt
+    emit_lrz_clears<CHIP>(batch);
+ 
+    fd6_emit_restore<CHIP>(batch, ring);
+-   fd6_emit_lrz_flush(ring);
++   fd6_event_write<CHIP>(batch->ctx, ring, FD_LRZ_FLUSH);
+ 
+    if (batch->prologue) {
+       if (!batch->nondraw) {
+@@ -1851,12 +1856,12 @@ fd6_emit_sysmem_prep(struct fd_batch *batch) assert_dt
+    OUT_PKT7(ring, CP_SET_VISIBILITY_OVERRIDE, 1);
+    OUT_RING(ring, 0x1);
+ 
+-   emit_zs<CHIP>(ring, pfb->zsbuf, NULL);
++   emit_zs<CHIP>(batch->ctx, ring, pfb->zsbuf, NULL);
+    emit_mrt<CHIP>(ring, pfb, NULL);
+    emit_msaa(ring, pfb->samples);
+    patch_fb_read_sysmem(batch);
+ 
+-   emit_common_init(batch);
++   emit_common_init<CHIP>(batch);
+ }
+ 
+ template <chip CHIP>
+@@ -1875,7 +1880,7 @@ fd6_emit_sysmem(struct fd_batch *batch)
+          if (subpass->fast_cleared & (FD_BUFFER_DEPTH | FD_BUFFER_STENCIL))
+             flushes |= FD6_INVALIDATE_CCU_DEPTH;
+ 
+-         fd6_emit_flushes(batch->ctx, ring, flushes);
++         fd6_emit_flushes<CHIP>(batch->ctx, ring, flushes);
+          emit_sysmem_clears<CHIP>(batch, subpass);
+       }
+ 
+@@ -1885,18 +1890,19 @@ fd6_emit_sysmem(struct fd_batch *batch)
+       struct pipe_framebuffer_state *pfb = &batch->framebuffer;
+       update_render_cntl<CHIP>(batch, pfb, false);
+ 
+-      emit_lrz(batch, subpass);
++      emit_lrz<CHIP>(batch, subpass);
+ 
+       fd6_emit_ib(ring, subpass->draw);
+    }
+ }
+ 
++template <chip CHIP>
+ static void
+ fd6_emit_sysmem_fini(struct fd_batch *batch) assert_dt
+ {
+    struct fd_ringbuffer *ring = batch->gmem;
+ 
+-   emit_common_fini(batch);
++   emit_common_fini<CHIP>(batch);
+ 
+    if (batch->tile_epilogue)
+       fd6_emit_ib(batch->gmem, batch->tile_epilogue);
+@@ -1907,11 +1913,11 @@ fd6_emit_sysmem_fini(struct fd_batch *batch) assert_dt
+    OUT_PKT7(ring, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
+    OUT_RING(ring, 0x0);
+ 
+-   fd6_emit_lrz_flush(ring);
++   fd6_event_write<CHIP>(batch->ctx, ring, FD_LRZ_FLUSH);
+ 
+-   fd6_emit_flushes(batch->ctx, ring,
+-                    FD6_FLUSH_CCU_COLOR |
+-                    FD6_FLUSH_CCU_DEPTH);
++   fd6_emit_flushes<CHIP>(batch->ctx, ring,
++                          FD6_FLUSH_CCU_COLOR |
++                          FD6_FLUSH_CCU_DEPTH);
+ }
+ 
+ template <chip CHIP>
+@@ -1925,11 +1931,11 @@ fd6_gmem_init(struct pipe_context *pctx)
+    ctx->emit_tile_prep = fd6_emit_tile_prep<CHIP>;
+    ctx->emit_tile_mem2gmem = fd6_emit_tile_mem2gmem;
+    ctx->emit_tile_renderprep = fd6_emit_tile_renderprep;
+-   ctx->emit_tile = fd6_emit_tile;
++   ctx->emit_tile = fd6_emit_tile<CHIP>;
+    ctx->emit_tile_gmem2mem = fd6_emit_tile_gmem2mem;
+-   ctx->emit_tile_fini = fd6_emit_tile_fini;
++   ctx->emit_tile_fini = fd6_emit_tile_fini<CHIP>;
+    ctx->emit_sysmem_prep = fd6_emit_sysmem_prep<CHIP>;
+    ctx->emit_sysmem = fd6_emit_sysmem<CHIP>;
+-   ctx->emit_sysmem_fini = fd6_emit_sysmem_fini;
++   ctx->emit_sysmem_fini = fd6_emit_sysmem_fini<CHIP>;
+ }
+ FD_GENX(fd6_gmem_init);
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_query.cc b/src/gallium/drivers/freedreno/a6xx/fd6_query.cc
+index 71dd61050ed..1c6bb0a6e71 100644
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_query.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_query.cc
+@@ -71,6 +71,7 @@ DEFINE_CAST(fd_acc_query_sample, fd6_query_sample);
+  * interpret results
+  */
+ 
++template <chip CHIP>
+ static void
+ occlusion_resume(struct fd_acc_query *aq, struct fd_batch *batch)
+ {
+@@ -84,9 +85,10 @@ occlusion_resume(struct fd_acc_query *aq, struct fd_batch *batch)
+    OUT_PKT4(ring, REG_A6XX_RB_SAMPLE_COUNT_ADDR, 2);
+    OUT_RELOC(ring, query_sample(aq, start));
+ 
+-   fd6_event_write(batch, ring, ZPASS_DONE, false);
++   fd6_event_write<CHIP>(batch->ctx, ring, FD_ZPASS_DONE);
+ }
+ 
++template <chip CHIP>
+ static void
+ occlusion_pause(struct fd_acc_query *aq, struct fd_batch *batch) assert_dt
+ {
+@@ -107,7 +109,7 @@ occlusion_pause(struct fd_acc_query *aq, struct fd_batch *batch) assert_dt
+    OUT_PKT4(ring, REG_A6XX_RB_SAMPLE_COUNT_ADDR, 2);
+    OUT_RELOC(ring, query_sample(aq, stop));
+ 
+-   fd6_event_write(batch, ring, ZPASS_DONE, false);
++   fd6_event_write<CHIP>(batch->ctx, ring, FD_ZPASS_DONE);
+ 
+    /* To avoid stalling in the draw buffer, emit code the code to compute the
+     * counter delta in the epilogue ring.
+@@ -185,29 +187,32 @@ occlusion_predicate_result_resource(struct fd_acc_query *aq, struct fd_ringbuffe
+                offsetof(struct fd6_query_sample, result));
+ }
+ 
++template <chip CHIP>
+ static const struct fd_acc_sample_provider occlusion_counter = {
+    .query_type = PIPE_QUERY_OCCLUSION_COUNTER,
+    .size = sizeof(struct fd6_query_sample),
+-   .resume = occlusion_resume,
+-   .pause = occlusion_pause,
++   .resume = occlusion_resume<CHIP>,
++   .pause = occlusion_pause<CHIP>,
+    .result = occlusion_counter_result,
+    .result_resource = occlusion_counter_result_resource,
+ };
+ 
++template <chip CHIP>
+ static const struct fd_acc_sample_provider occlusion_predicate = {
+    .query_type = PIPE_QUERY_OCCLUSION_PREDICATE,
+    .size = sizeof(struct fd6_query_sample),
+-   .resume = occlusion_resume,
+-   .pause = occlusion_pause,
++   .resume = occlusion_resume<CHIP>,
++   .pause = occlusion_pause<CHIP>,
+    .result = occlusion_predicate_result,
+    .result_resource = occlusion_predicate_result_resource,
+ };
+ 
++template <chip CHIP>
+ static const struct fd_acc_sample_provider occlusion_predicate_conservative = {
+    .query_type = PIPE_QUERY_OCCLUSION_PREDICATE_CONSERVATIVE,
+    .size = sizeof(struct fd6_query_sample),
+-   .resume = occlusion_resume,
+-   .pause = occlusion_pause,
++   .resume = occlusion_resume<CHIP>,
++   .pause = occlusion_pause<CHIP>,
+    .result = occlusion_predicate_result,
+    .result_resource = occlusion_predicate_result_resource,
+ };
+@@ -216,28 +221,22 @@ static const struct fd_acc_sample_provider occlusion_predicate_conservative = {
+  * Timestamp Queries:
+  */
+ 
++template <chip CHIP>
+ static void
+ timestamp_resume(struct fd_acc_query *aq, struct fd_batch *batch)
+ {
+    struct fd_ringbuffer *ring = batch->draw;
+ 
+-   OUT_PKT7(ring, CP_EVENT_WRITE, 4);
+-   OUT_RING(ring,
+-            CP_EVENT_WRITE_0_EVENT(RB_DONE_TS) | CP_EVENT_WRITE_0_TIMESTAMP);
+-   OUT_RELOC(ring, query_sample(aq, start));
+-   OUT_RING(ring, 0x00000000);
++   fd6_record_ts<CHIP>(ring, query_sample(aq, start));
+ }
+ 
++template <chip CHIP>
+ static void
+ time_elapsed_pause(struct fd_acc_query *aq, struct fd_batch *batch) assert_dt
+ {
+    struct fd_ringbuffer *ring = batch->draw;
+ 
+-   OUT_PKT7(ring, CP_EVENT_WRITE, 4);
+-   OUT_RING(ring,
+-            CP_EVENT_WRITE_0_EVENT(RB_DONE_TS) | CP_EVENT_WRITE_0_TIMESTAMP);
+-   OUT_RELOC(ring, query_sample(aq, stop));
+-   OUT_RING(ring, 0x00000000);
++   fd6_record_ts<CHIP>(ring, query_sample(aq, stop));
+ 
+    OUT_WFI5(ring);
+ 
+@@ -257,14 +256,11 @@ timestamp_pause(struct fd_acc_query *aq, struct fd_batch *batch)
+ }
+ 
+ /* timestamp logging for u_trace: */
++template <chip CHIP>
+ static void
+ record_timestamp(struct fd_ringbuffer *ring, struct fd_bo *bo, unsigned offset)
+ {
+-   OUT_PKT7(ring, CP_EVENT_WRITE, 4);
+-   OUT_RING(ring,
+-            CP_EVENT_WRITE_0_EVENT(RB_DONE_TS) | CP_EVENT_WRITE_0_TIMESTAMP);
+-   OUT_RELOC(ring, bo, offset, 0, 0);
+-   OUT_RING(ring, 0x00000000);
++   fd6_record_ts<CHIP>(ring, bo, offset, 0, 0);
+ }
+ 
+ static void
+@@ -307,12 +303,13 @@ timestamp_result_resource(struct fd_acc_query *aq, struct fd_ringbuffer *ring,
+                offsetof(struct fd6_query_sample, start));
+ }
+ 
++template <chip CHIP>
+ static const struct fd_acc_sample_provider time_elapsed = {
+    .query_type = PIPE_QUERY_TIME_ELAPSED,
+    .always = true,
+    .size = sizeof(struct fd6_query_sample),
+-   .resume = timestamp_resume,
+-   .pause = time_elapsed_pause,
++   .resume = timestamp_resume<CHIP>,
++   .pause = time_elapsed_pause<CHIP>,
+    .result = time_elapsed_accumulate_result,
+    .result_resource = time_elapsed_result_resource,
+ };
+@@ -324,11 +321,12 @@ static const struct fd_acc_sample_provider time_elapsed = {
+  * kind of good enough.
+  */
+ 
++template <chip CHIP>
+ static const struct fd_acc_sample_provider timestamp = {
+    .query_type = PIPE_QUERY_TIMESTAMP,
+    .always = true,
+    .size = sizeof(struct fd6_query_sample),
+-   .resume = timestamp_resume,
++   .resume = timestamp_resume<CHIP>,
+    .pause = timestamp_pause,
+    .result = timestamp_accumulate_result,
+    .result_resource = timestamp_result_resource,
+@@ -372,11 +370,11 @@ enum stats_type {
+ };
+ 
+ static const struct {
+-   enum vgt_event_type start, stop;
++   enum fd_gpu_event start, stop;
+ } stats_counter_events[] = {
+-      [STATS_PRIMITIVE] = { START_PRIMITIVE_CTRS, STOP_PRIMITIVE_CTRS },
+-      [STATS_FRAGMENT]  = { START_FRAGMENT_CTRS,  STOP_FRAGMENT_CTRS },
+-      [STATS_COMPUTE]   = { START_COMPUTE_CTRS,   STOP_COMPUTE_CTRS },
++      [STATS_PRIMITIVE] = { FD_START_PRIMITIVE_CTRS, FD_STOP_PRIMITIVE_CTRS },
++      [STATS_FRAGMENT]  = { FD_START_FRAGMENT_CTRS,  FD_STOP_FRAGMENT_CTRS },
++      [STATS_COMPUTE]   = { FD_START_COMPUTE_CTRS,   FD_STOP_COMPUTE_CTRS },
+ };
+ 
+ static enum stats_type
+@@ -440,6 +438,7 @@ log_pipeline_stats(struct fd6_pipeline_stats_sample *ps, unsigned idx)
+ #endif
+ }
+ 
++template <chip CHIP>
+ static void
+ pipeline_stats_resume(struct fd_acc_query *aq, struct fd_batch *batch)
+    assert_dt
+@@ -460,10 +459,11 @@ pipeline_stats_resume(struct fd_acc_query *aq, struct fd_batch *batch)
+    assert(type < ARRAY_SIZE(batch->pipeline_stats_queries_active));
+ 
+    if (!batch->pipeline_stats_queries_active[type])
+-      fd6_event_write(batch, ring, stats_counter_events[type].start, false);
++      fd6_event_write<CHIP>(batch->ctx, ring, stats_counter_events[type].start);
+    batch->pipeline_stats_queries_active[type]++;
+ }
+ 
++template <chip CHIP>
+ static void
+ pipeline_stats_pause(struct fd_acc_query *aq, struct fd_batch *batch)
+    assert_dt
+@@ -487,7 +487,7 @@ pipeline_stats_pause(struct fd_acc_query *aq, struct fd_batch *batch)
+ 
+    batch->pipeline_stats_queries_active[type]--;
+    if (batch->pipeline_stats_queries_active[type])
+-      fd6_event_write(batch, ring, stats_counter_events[type].stop, false);
++      fd6_event_write<CHIP>(batch->ctx, ring, stats_counter_events[type].stop);
+ 
+    /* result += stop - start: */
+    OUT_PKT7(ring, CP_MEM_TO_MEM, 9);
+@@ -521,20 +521,22 @@ pipeline_stats_result_resource(struct fd_acc_query *aq,
+                offsetof(struct fd6_pipeline_stats_sample, result));
+ }
+ 
++template <chip CHIP>
+ static const struct fd_acc_sample_provider primitives_generated = {
+    .query_type = PIPE_QUERY_PRIMITIVES_GENERATED,
+    .size = sizeof(struct fd6_pipeline_stats_sample),
+-   .resume = pipeline_stats_resume,
+-   .pause = pipeline_stats_pause,
++   .resume = pipeline_stats_resume<CHIP>,
++   .pause = pipeline_stats_pause<CHIP>,
+    .result = pipeline_stats_result,
+    .result_resource = pipeline_stats_result_resource,
+ };
+ 
++template <chip CHIP>
+ static const struct fd_acc_sample_provider pipeline_statistics_single = {
+    .query_type = PIPE_QUERY_PIPELINE_STATISTICS_SINGLE,
+    .size = sizeof(struct fd6_pipeline_stats_sample),
+-   .resume = pipeline_stats_resume,
+-   .pause = pipeline_stats_pause,
++   .resume = pipeline_stats_resume<CHIP>,
++   .pause = pipeline_stats_pause<CHIP>,
+    .result = pipeline_stats_result,
+    .result_resource = pipeline_stats_result_resource,
+ };
+@@ -576,6 +578,7 @@ log_primitives_sample(struct fd6_primitives_sample *ps)
+ #endif
+ }
+ 
++template <chip CHIP>
+ static void
+ primitives_emitted_resume(struct fd_acc_query *aq,
+                           struct fd_batch *batch) assert_dt
+@@ -589,7 +592,7 @@ primitives_emitted_resume(struct fd_acc_query *aq,
+    OUT_PKT4(ring, REG_A6XX_VPC_SO_STREAM_COUNTS, 2);
+    primitives_reloc(ring, aq, start[0]);
+ 
+-   fd6_event_write(batch, ring, WRITE_PRIMITIVE_COUNTS, false);
++   fd6_event_write<CHIP>(batch->ctx, ring, FD_WRITE_PRIMITIVE_COUNTS);
+ }
+ 
+ static void
+@@ -620,6 +623,7 @@ accumultate_primitives_generated(struct fd_acc_query *aq,
+    primitives_reloc(ring, aq, start[idx].generated);
+ }
+ 
++template <chip CHIP>
+ static void
+ primitives_emitted_pause(struct fd_acc_query *aq,
+                          struct fd_batch *batch) assert_dt
+@@ -633,9 +637,8 @@ primitives_emitted_pause(struct fd_acc_query *aq,
+    OUT_PKT4(ring, REG_A6XX_VPC_SO_STREAM_COUNTS, 2);
+    primitives_reloc(ring, aq, stop[0]);
+ 
+-   fd6_event_write(batch, ring, WRITE_PRIMITIVE_COUNTS, false);
+-
+-   fd6_event_write(batch, batch->draw, CACHE_FLUSH_TS, true);
++   fd6_event_write<CHIP>(batch->ctx, ring, FD_WRITE_PRIMITIVE_COUNTS);
++   fd6_event_write<CHIP>(batch->ctx, ring, FD_CACHE_CLEAN);
+ 
+    if (aq->provider->query_type == PIPE_QUERY_SO_OVERFLOW_ANY_PREDICATE) {
+       /* Need results from all channels: */
+@@ -719,29 +722,32 @@ so_overflow_predicate_result_resource(struct fd_acc_query *aq,
+    OUT_RING(ring, 0);
+ }
+ 
++template <chip CHIP>
+ static const struct fd_acc_sample_provider primitives_emitted = {
+    .query_type = PIPE_QUERY_PRIMITIVES_EMITTED,
+    .size = sizeof(struct fd6_primitives_sample),
+-   .resume = primitives_emitted_resume,
+-   .pause = primitives_emitted_pause,
++   .resume = primitives_emitted_resume<CHIP>,
++   .pause = primitives_emitted_pause<CHIP>,
+    .result = primitives_emitted_result,
+    .result_resource = primitives_emitted_result_resource,
+ };
+ 
++template <chip CHIP>
+ static const struct fd_acc_sample_provider so_overflow_any_predicate = {
+    .query_type = PIPE_QUERY_SO_OVERFLOW_ANY_PREDICATE,
+    .size = sizeof(struct fd6_primitives_sample),
+-   .resume = primitives_emitted_resume,
+-   .pause = primitives_emitted_pause,
++   .resume = primitives_emitted_resume<CHIP>,
++   .pause = primitives_emitted_pause<CHIP>,
+    .result = so_overflow_predicate_result,
+    .result_resource = so_overflow_predicate_result_resource,
+ };
+ 
++template <chip CHIP>
+ static const struct fd_acc_sample_provider so_overflow_predicate = {
+    .query_type = PIPE_QUERY_SO_OVERFLOW_PREDICATE,
+    .size = sizeof(struct fd6_primitives_sample),
+-   .resume = primitives_emitted_resume,
+-   .pause = primitives_emitted_pause,
++   .resume = primitives_emitted_resume<CHIP>,
++   .pause = primitives_emitted_pause<CHIP>,
+    .result = so_overflow_predicate_result,
+    .result_resource = so_overflow_predicate_result_resource,
+ };
+@@ -942,6 +948,7 @@ error:
+    return NULL;
+ }
+ 
++template <chip CHIP>
+ void
+ fd6_query_context_init(struct pipe_context *pctx) disable_thread_safety_analysis
+ {
+@@ -950,22 +957,23 @@ fd6_query_context_init(struct pipe_context *pctx) disable_thread_safety_analysis
+    ctx->create_query = fd_acc_create_query;
+    ctx->query_update_batch = fd_acc_query_update_batch;
+ 
+-   ctx->record_timestamp = record_timestamp;
++   ctx->record_timestamp = record_timestamp<CHIP>;
+    ctx->ts_to_ns = ticks_to_ns;
+ 
+    pctx->create_batch_query = fd6_create_batch_query;
+ 
+-   fd_acc_query_register_provider(pctx, &occlusion_counter);
+-   fd_acc_query_register_provider(pctx, &occlusion_predicate);
+-   fd_acc_query_register_provider(pctx, &occlusion_predicate_conservative);
++   fd_acc_query_register_provider(pctx, &occlusion_counter<CHIP>);
++   fd_acc_query_register_provider(pctx, &occlusion_predicate<CHIP>);
++   fd_acc_query_register_provider(pctx, &occlusion_predicate_conservative<CHIP>);
+ 
+-   fd_acc_query_register_provider(pctx, &time_elapsed);
+-   fd_acc_query_register_provider(pctx, &timestamp);
++   fd_acc_query_register_provider(pctx, &time_elapsed<CHIP>);
++   fd_acc_query_register_provider(pctx, &timestamp<CHIP>);
+ 
+-   fd_acc_query_register_provider(pctx, &primitives_generated);
+-   fd_acc_query_register_provider(pctx, &pipeline_statistics_single);
++   fd_acc_query_register_provider(pctx, &primitives_generated<CHIP>);
++   fd_acc_query_register_provider(pctx, &pipeline_statistics_single<CHIP>);
+ 
+-   fd_acc_query_register_provider(pctx, &primitives_emitted);
+-   fd_acc_query_register_provider(pctx, &so_overflow_any_predicate);
+-   fd_acc_query_register_provider(pctx, &so_overflow_predicate);
++   fd_acc_query_register_provider(pctx, &primitives_emitted<CHIP>);
++   fd_acc_query_register_provider(pctx, &so_overflow_any_predicate<CHIP>);
++   fd_acc_query_register_provider(pctx, &so_overflow_predicate<CHIP>);
+ }
++FD_GENX(fd6_query_context_init);
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_query.h b/src/gallium/drivers/freedreno/a6xx/fd6_query.h
+index ae645484607..c98e975bb55 100644
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_query.h
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_query.h
+@@ -30,7 +30,7 @@
+ 
+ #include "pipe/p_context.h"
+ 
+-EXTERNC
++template <chip CHIP>
+ void fd6_query_context_init(struct pipe_context *pctx);
+ 
+ #endif /* FD6_QUERY_H_ */
+diff --git a/src/gallium/drivers/freedreno/freedreno_batch.h b/src/gallium/drivers/freedreno/freedreno_batch.h
+index b419d8ec690..e0c2e4cc4ea 100644
+--- a/src/gallium/drivers/freedreno/freedreno_batch.h
++++ b/src/gallium/drivers/freedreno/freedreno_batch.h
+@@ -433,7 +433,9 @@ fd_reset_wfi(struct fd_batch *batch)
+ void fd_wfi(struct fd_batch *batch, struct fd_ringbuffer *ring) assert_dt;
+ 
+ /* emit a CP_EVENT_WRITE:
++ * (a6xx+ cannot use this, use fd6_event_write<chip>.)
+  */
++#ifndef __cplusplus
+ static inline void
+ fd_event_write(struct fd_batch *batch, struct fd_ringbuffer *ring,
+                enum vgt_event_type evt)
+@@ -442,6 +444,7 @@ fd_event_write(struct fd_batch *batch, struct fd_ringbuffer *ring,
+    OUT_RING(ring, evt);
+    fd_reset_wfi(batch);
+ }
++#endif
+ 
+ /* Get per-tile epilogue */
+ static inline struct fd_ringbuffer *
+-- 
+2.45.2
+
