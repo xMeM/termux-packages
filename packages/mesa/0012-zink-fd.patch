@@ -1,0 +1,36 @@
+diff --git a/src/gallium/drivers/zink/zink_resource.c b/src/gallium/drivers/zink/zink_resource.c
+index 0e29737d0ff..2efa32ececa 100644
+--- a/src/gallium/drivers/zink/zink_resource.c
++++ b/src/gallium/drivers/zink/zink_resource.c
+@@ -2006,6 +2006,11 @@ zink_resource_from_handle(struct pipe_screen *pscreen,
+                  unsigned usage)
+ {
+ #ifdef ZINK_USE_DMABUF
++   if (zink_driverid(zink_screen(pscreen)) == VK_DRIVER_ID_QUALCOMM_PROPRIETARY) {
++      whandle->type = ZINK_EXTERNAL_MEMORY_HANDLE;
++      whandle->modifier = DRM_FORMAT_MOD_INVALID;
++   }
++
+    if (whandle->modifier != DRM_FORMAT_MOD_INVALID &&
+        !zink_screen(pscreen)->info.have_EXT_image_drm_format_modifier)
+       return NULL;
+diff --git a/src/gallium/drivers/zink/zink_screen.c b/src/gallium/drivers/zink/zink_screen.c
+index ac9e726630c..f5001bb84ec 100644
+--- a/src/gallium/drivers/zink/zink_screen.c
++++ b/src/gallium/drivers/zink/zink_screen.c
+@@ -1179,7 +1179,6 @@ zink_init_screen_caps(struct zink_screen *screen)
+    caps->dmabuf =
+ #if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD)
+       screen->info.have_KHR_external_memory_fd &&
+-      screen->info.have_EXT_external_memory_dma_buf &&
+       screen->info.have_EXT_queue_family_foreign
+       ? DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT : 0;
+ #else
+@@ -3025,6 +3024,7 @@ init_driver_workarounds(struct zink_screen *screen)
+    case VK_DRIVER_ID_MESA_TURNIP:
+    case VK_DRIVER_ID_MESA_NVK:
+    case VK_DRIVER_ID_MESA_LLVMPIPE:
++   case VK_DRIVER_ID_QUALCOMM_PROPRIETARY:
+       screen->driver_workarounds.can_do_invalid_linear_modifier = true;
+       break;
+    default:
