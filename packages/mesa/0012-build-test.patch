@@ -1,0 +1,17 @@
+diff --git a/src/gallium/targets/dri/meson.build b/src/gallium/targets/dri/meson.build
+index 5ecdc7be6e7..6e4b41b745a 100644
+--- a/src/gallium/targets/dri/meson.build
++++ b/src/gallium/targets/dri/meson.build
+@@ -23,12 +23,6 @@ if with_gallium_va or with_gallium_vdpau
+   endif
+ endif
+ 
+-dri_sym = configure_file(input : 'dri.sym.in', output : 'dri.sym', configuration : sym_config)
+-
+-if with_ld_version_script
+-  gallium_dri_ld_args += ['-Wl,--version-script', join_paths(meson.current_build_dir(), 'dri.sym')]
+-  gallium_dri_link_depends += dri_sym
+-endif
+ if with_ld_dynamic_list
+   gallium_dri_ld_args += ['-Wl,--dynamic-list', join_paths(meson.current_source_dir(), '../dri.dyn')]
+   gallium_dri_link_depends += files('../dri.dyn')
